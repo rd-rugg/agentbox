@@ -1,0 +1,9 @@
+# gitleaks, run by .github/workflows/checks.yml on each pull request's new commits: the default rules,
+# less the made-up credentials the offline tests use. Add a path here only when what it holds is
+# plainly fake; a real key belongs in the secret store, never in the repository.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Made-up credentials in the offline tests (redaction and .env import)"
+paths = ['''^tests/test_offline\.py$''']

@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Print a GitHub token for git and gh on the box.
+
+With a GitHub App in Bitwarden (CLI__GH_APP_ID, CLI__GH_APP_PRIVATE_KEY, CLI__GH_APP_INSTALLATION_ID) it
+prints an installation token: valid one hour, minted on demand and cached in RAM until five minutes before
+it expires. App tokens carry permissions fine-grained personal tokens can't have (Checks: read). Without
+the app it falls back to the personal token CLI__GH_TOKEN. Exits 1 with nothing on stdout when neither works.
+"""
+import base64
+import calendar
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+CACHE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/dev/shm", f"agentbox-github-token-{os.getuid()}.json")
+MARGIN = 300  # seconds before expiry when a cached token is replaced
+
+
+def secret(name):
+    proc = subprocess.run(["secrets", "--get", "cli", name], capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 and proc.stdout.strip() else None
+
+
+def b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def app_jwt(app_id, pem, now):
+    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+    payload = b64url(json.dumps({"iat": now - 60, "exp": now + 540, "iss": app_id}).encode())
+    signing_input = f"{header}.{payload}".encode()
+    fd, key_path = tempfile.mkstemp(dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
+    try:
+        os.write(fd, pem.encode())
+        os.close(fd)
+        sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", key_path], input=signing_input,
+                             capture_output=True, check=True).stdout
+    finally:
+        os.unlink(key_path)
+    return f"{header}.{payload}.{b64url(sig)}"
+
+
+def cached(now):
+    try:
+        with open(CACHE) as fh:
+            data = json.load(fh)
+        return data["token"] if data["expires"] - MARGIN > now else None
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def save(token, expires):
+    fd = os.open(CACHE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"token": token, "expires": expires}, fh)
+
+
+def installation_token(now):
+    app_id, pem, inst = (secret("GH_APP_ID"), secret("GH_APP_PRIVATE_KEY"), secret("GH_APP_INSTALLATION_ID"))
+    if not (app_id and pem and inst):
+        return None
+    req = urllib.request.Request(f"https://api.github.com/app/installations/{inst}/access_tokens", method="POST",
+                                 headers={"Authorization": f"Bearer {app_jwt(app_id, pem, now)}",
+                                          "Accept": "application/vnd.github+json",
+                                          "User-Agent": "agentbox-github-token"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.load(resp)
+    expires = calendar.timegm(time.strptime(data["expires_at"], "%Y-%m-%dT%H:%M:%SZ"))
+    save(data["token"], expires)
+    return data["token"]
+
+
+def main():
+    now = int(time.time())
+    token = cached(now)
+    if not token:
+        try:
+            token = installation_token(now)
+        except Exception as err:  # fall back to the personal token rather than leave git without one
+            print(f"github-token: GitHub App token failed ({err}); using CLI__GH_TOKEN", file=sys.stderr)
+            token = None
+    token = token or secret("GH_TOKEN")
+    if not token:
+        return 1
+    print(token)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

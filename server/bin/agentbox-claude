@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# `claude` for agents another program starts on the box (T3 Code's server, BOX_T3=1): the same
+# sign-in tab sessions get from run_agent. Boxes in a pool can't share one login, so a box
+# without its own login uses the long-lived token CLI__CLAUDE_TOKEN_DEFAULT, read from the RAM
+# cache of `secrets` and never written anywhere. Installed as ~/.local/share/agentbox/bin/claude,
+# which comes first on PATH; tab sessions already have the token and pass straight through.
+set -euo pipefail
+self_dir=$(cd "$(dirname "$0")" && pwd)
+
+# The real claude: the next one on PATH after this folder.
+real=""
+IFS=: read -ra dirs <<< "$PATH"
+for d in "${dirs[@]}"; do
+  [ -n "$d" ] && [ "$(cd "$d" 2>/dev/null && pwd)" != "$self_dir" ] || continue
+  if [ -x "$d/claude" ]; then real="$d/claude"; break; fi
+done
+[ -n "$real" ] || { echo "claude: not installed on this box" >&2; exit 127; }
+
+logged_in() {
+  python3 - "$HOME/.claude/.credentials.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    sys.exit(0 if (json.load(open(sys.argv[1])).get("claudeAiOauth") or {}).get("accessToken") else 1)
+except (OSError, ValueError):
+    sys.exit(1)
+PY
+}
+
+if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && ! logged_in && token=$(secrets --get cli CLAUDE_TOKEN_DEFAULT 2>/dev/null); then
+  export CLAUDE_CODE_OAUTH_TOKEN="$token"
+fi
+exec "$real" "$@"

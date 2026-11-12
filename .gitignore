@@ -1,0 +1,7 @@
+.env
+.env.*
+box.conf
+__pycache__/
+*.env
+bws.env
+bitwarden-import*.json

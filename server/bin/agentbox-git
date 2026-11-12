@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Work in git that exists only on this machine, the one test of "is it on GitHub".
+
+  agentbox-git status ROOT [--fetch]   one line per checkout with such work: PATH<TAB>issues
+                                       (PATH relative to ROOT; ROOT itself is .)
+
+A checkout's commits are safe when GitHub (the remote `origin`) has them, by any route:
+- on some branch of origin, whatever it's called (`rev-list REV --not --remotes=origin`);
+- or merged into origin's default branch by a squash or rebase, after which the branch is
+  usually deleted: then the branch's changes are already in the default branch (checked
+  by reverse-applying them in a scratch index holding it; works with git 2.34).
+Anything git can't read is reported, never taken as safe: this test runs before a box is
+deleted. Every checkout of every repo counts, found through `git worktree list` (Claude
+Code's worktrees are 5 folders deep, in PROJECT/.claude/worktrees/NAME); repos are looked
+for up to 4 folders under ROOT. Also reported: local branches not checked out that hold
+commits of their own, and stashes.
+
+Used on the box by `box --git-status` (box close, box tick, box ls), and through its
+functions by the laptop's projects.py (box check) and sessions.py (box session): one
+implementation. Standard library only.
+"""
+import os
+import subprocess
+import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+
+REMOTE = "origin"
+DEPTH = 4   # how deep under ROOT repos are looked for (their worktrees come from git)
+PRUNE = {".git", ".claude", "node_modules", ".venv", "venv", "__pycache__", ".next", "dist", "build",
+         ".terraform", ".cache", "target", "vendor"}
+# Never wait for a password or passphrase: a prompt nobody sees would stall the command.
+QUIET = {"GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o ConnectTimeout=10"}
+
+
+def git(path, *args, timeout=60, env=None, stdin=None):
+    """git's output (stripped), or None when it fails."""
+    try:
+        r = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=timeout,
+                           input=stdin, env={**os.environ, **QUIET, **(env or {})})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def repos(root):
+    """Main checkouts up to DEPTH folders under ROOT (folders with a .git directory)."""
+    found, top = [], os.path.realpath(root)
+    for d, dirs, _ in os.walk(top):
+        if os.path.isdir(os.path.join(d, ".git")):
+            found.append(d)
+        depth = 0 if d == top else d[len(top) + 1:].count(os.sep) + 1
+        dirs[:] = sorted(x for x in dirs if x not in PRUNE) if depth < DEPTH else []
+    return found
+
+
+def checkouts(repo):
+    """Every checkout of REPO's repository: [{path, head, branch}], the main one first."""
+    out = []
+    for block in (git(repo, "worktree", "list", "--porcelain") or "").split("\n\n"):
+        f = dict((line.split(" ", 1) + [""])[:2] for line in block.splitlines())
+        if f.get("worktree") and "bare" not in f and os.path.isdir(f["worktree"]):
+            out.append({"path": f["worktree"], "head": f.get("HEAD") or None,
+                        "branch": f.get("branch", "").replace("refs/heads/", "") or None})
+    return out
+
+
+def fetch(repo):
+    """Bring origin's branches up to date, dropping deleted ones. False when it couldn't."""
+    return git(repo, "fetch", "-q", "--prune", REMOTE, timeout=60) is not None
+
+
+def default_branch(path):
+    """origin's default branch as a ref (origin/HEAD, else origin/main or origin/master)."""
+    for ref in (f"refs/remotes/{REMOTE}/HEAD", f"refs/remotes/{REMOTE}/main", f"refs/remotes/{REMOTE}/master"):
+        if git(path, "rev-parse", "-q", "--verify", ref + "^{commit}"):
+            return ref
+    return None
+
+
+def merged_by_content(path, rev):
+    """True when REV's changes since it left origin's default branch are already in that
+    branch (a squash or rebase merge): they reverse-apply onto it, in a scratch index."""
+    base = default_branch(path)
+    fork = base and git(path, "merge-base", base, rev)
+    if not fork:
+        return False
+    diff = git(path, "diff", "--binary", fork, rev)
+    if diff is None:
+        return False
+    if not diff:
+        return True   # no change of its own
+    with tempfile.TemporaryDirectory() as tmp:
+        index = {"GIT_INDEX_FILE": os.path.join(tmp, "index")}
+        return (git(path, "read-tree", base, env=index) is not None
+                and git(path, "apply", "--cached", "--check", "--reverse", env=index, stdin=diff + "\n") is not None)
+
+
+def local_only(path, rev="HEAD"):
+    """Commits of REV GitHub doesn't have: 0 when it has them all (on any branch, or merged
+    into the default branch by content), None when git couldn't tell."""
+    n = git(path, "rev-list", "--count", rev, "--not", f"--remotes={REMOTE}")
+    if n is None or not n.isdigit():
+        return None
+    return 0 if int(n) and merged_by_content(path, rev) else int(n)
+
+
+def problems(repo):
+    """[(path, [issues])] for REPO's checkouts with work only here, the main checkout first;
+    its other local branches and stashes are listed on the main checkout."""
+    result, checked_out = [], set()
+    has_remote = git(repo, "remote", "get-url", REMOTE) is not None
+    for c in checkouts(repo) or [{"path": repo, "head": None, "branch": None}]:
+        issues = []
+        dirty = git(c["path"], "status", "--porcelain")
+        if dirty is None:
+            issues.append("git can't read it (check it by hand)")
+        elif dirty:
+            issues.append(f"{len(dirty.splitlines())} uncommitted")
+        if c["head"]:
+            what = f"branch {c['branch']}" if c["branch"] else "a detached HEAD"
+            n = local_only(c["path"])
+            if not has_remote:
+                issues.append(f"{what}: no {REMOTE} remote, the only copy")
+            elif n is None:
+                issues.append(f"{what}: couldn't compare with GitHub")
+            elif n:
+                issues.append(f"{n} commit(s) on {what} not on GitHub")
+        if c["branch"]:
+            checked_out.add(c["branch"])
+        result.append((c["path"], issues))
+    others = [b for b in (git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads") or "").splitlines()
+              if b and b not in checked_out and (not has_remote or local_only(repo, f"refs/heads/{b}") != 0)]
+    stashes = len((git(repo, "stash", "list") or "").splitlines())
+    if others:
+        result[0][1].append("branch(es) not on GitHub: " + ", ".join(others))
+    if stashes:
+        result[0][1].append(f"{stashes} stash(es)")
+    return [(p, i) for p, i in result if i]
+
+
+def status(root, do_fetch=False):
+    """[(path, issues text)] for every checkout under ROOT with work only on this machine."""
+    found = repos(root)
+    if do_fetch:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(fetch, found))
+    seen, lines, top = set(), [], os.path.realpath(root)
+    for repo in found:
+        for path, issues in problems(repo):
+            real = os.path.realpath(path)
+            if real in seen:
+                continue
+            seen.add(real)
+            rel = os.path.relpath(real, top) if real == top or real.startswith(top + os.sep) else path
+            lines.append((rel, ", ".join(issues)))
+    return lines
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[0] == "status":
+        for rel, text in status(argv[1], "--fetch" in argv[2:]):
+            print(f"{rel}\t{text}")
+        return 0
+    print(__doc__.strip().split("\n\n")[0], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Global pre-commit hook on the box (core.hooksPath): blocks commits that add
+.env files or any value stored in Bitwarden, then runs the repo's own hook.
+Bypass for a false positive: git commit --no-verify."""
+import json
+import os
+import re
+import subprocess
+import sys
+
+MIN_LEN = 16  # shorter values (regions, flags, ports) give false positives
+ENV_FILE = re.compile(r"(^|/)\.env(\.[^/]*)?$")
+ALLOWED = re.compile(r"\.(example|sample|template|dist)$")
+
+
+def git(*args):
+    return subprocess.run(["git", *args], capture_output=True, text=True).stdout
+
+
+def main():
+    problems = []
+    staged = git("diff", "--cached", "--name-only", "--diff-filter=ACMR").splitlines()
+    for path in staged:
+        if ENV_FILE.search(path) and not ALLOWED.search(path):
+            problems.append(f"{path}: env files hold secrets; use `secrets APP -- ...` instead")
+
+    added = "\n".join(line[1:] for line in git("diff", "--cached", "-U0").splitlines()
+                      if line.startswith("+") and not line.startswith("+++"))
+    out = subprocess.run(["secrets", "--all-values"], capture_output=True, text=True)
+    if out.returncode == 0:
+        for key, value in json.loads(out.stdout).items():
+            if len(value) >= MIN_LEN and value in added:
+                problems.append(f"the value of Bitwarden secret {key} is in the staged changes")
+    else:
+        # Fail closed: without the values we can't tell whether a secret is being committed.
+        problems.append("couldn't load Bitwarden secrets to check against "
+                        f"({out.stderr.strip() or 'no output'}); retry in a minute")
+    token_file = "/run/agentbox/bws.env"
+    if os.path.exists(token_file):
+        for line in open(token_file):
+            value = line.partition("=")[2].strip().strip("'\"")
+            if len(value) >= MIN_LEN and value in added:
+                problems.append("the Bitwarden access token is in the staged changes")
+
+    if problems:
+        print("pre-commit: commit blocked:", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        print("If this is a false positive: git commit --no-verify", file=sys.stderr)
+        sys.exit(1)
+
+    # Hand over to the repository's own .git/hooks/pre-commit, if any. (With
+    # core.hooksPath set, `git rev-parse --git-path hooks` would return this
+    # global folder, so build the path from the git dir instead.)
+    git_dir = git("rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    repo_hook = os.path.join(git_dir, "hooks", "pre-commit")
+    if os.access(repo_hook, os.X_OK) and os.path.realpath(repo_hook) != os.path.realpath(__file__):
+        os.execv(repo_hook, [repo_hook, *sys.argv[1:]])
+
+
+if __name__ == "__main__":
+    main()

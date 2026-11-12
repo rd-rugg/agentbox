@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""One fixed port for every project browser's viewer on this box (box browser on the box).
+
+  agentbox-browser-router PORT STATE_DIR
+
+Listens on 127.0.0.1:PORT, the port every laptop tab forwards. A request for /NAME/... (the
+viewer's page, its files and its WebSocket at /NAME/websockify) goes to the websockify of
+project NAME's browser, the port in STATE_DIR/NAME/state, with /NAME taken off the path.
+/NAME/open?t=TOKEN, the link box browser prints, sends the browser on to the viewer with its
+VNC password when TOKEN is one of NAME's (agentbox-browser link NAME, valid 15 minutes), so the
+password itself never lands in a terminal or an agent's transcript. Only requests to localhost
+(no other site's name pointing here) are served, and the WebSocket only for this page's own
+origin. agentbox-browser starts it with the first project browser and stops it with the last.
+"""
+import asyncio
+import hmac
+import os
+import re
+import sys
+import time
+import urllib.parse
+
+NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+LOCAL = re.compile(r"^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$")
+
+
+def route(target, view_port):
+    """(port, path) for a request target "/NAME/rest", or None. VIEW_PORT(NAME) is the port of
+    NAME's viewer, or None when NAME's browser isn't running."""
+    if not target.startswith("/"):
+        return None
+    name, _, rest = target[1:].partition("/")
+    if not NAME.match(name) or name in (".", ".."):
+        return None
+    port = view_port(name)
+    return (port, "/" + rest) if port else None
+
+
+def allowed(headers, upgrade):
+    """Served only for localhost (a page of another site, renamed to this address, isn't),
+    and the WebSocket only for a page from this same address."""
+    host = headers.get("host", "")
+    if not LOCAL.match(host):
+        return False
+    origin = headers.get("origin")
+    return not upgrade or origin is None or origin == "http://" + host
+
+
+class Projects:
+    """What STATE_DIR says about each project's browser."""
+
+    def __init__(self, state_dir):
+        self.dir = state_dir
+
+    def state(self, name):
+        try:
+            with open(os.path.join(self.dir, name, "state")) as fh:
+                return dict(l.rstrip("\n").split("=", 1) for l in fh if "=" in l)
+        except OSError:
+            return {}
+
+    def view_port(self, name):
+        port = self.state(name).get("view", "")
+        return int(port) if port.isdigit() else None
+
+    def opening(self, name, token, now=None):
+        """The viewer address for a valid TOKEN of NAME's links, or None."""
+        now = time.time() if now is None else now
+        try:
+            with open(os.path.join(self.dir, name, "links")) as fh:
+                links = [l.split() for l in fh]
+        except OSError:
+            return None
+        if not any(len(l) == 2 and hmac.compare_digest(l[0], token) and float(l[1]) > now for l in links):
+            return None
+        password = self.state(name).get("password", "")
+        q = urllib.parse.urlencode({"autoconnect": 1, "resize": "scale", "reconnect": 1,
+                                    "path": f"{name}/websockify", "password": password})
+        return f"/{name}/vnc.html?{q}"
+
+
+async def pipe(r, w):
+    try:
+        while data := await r.read(65536):
+            w.write(data)
+            await w.drain()
+    except ConnectionError:
+        pass
+    finally:
+        w.close()
+
+
+def page(status, title, text):
+    body = f"<!doctype html><meta charset=utf-8><title>{title}</title><p>{text}".encode()
+    return (f"HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n"
+            f"Cache-Control: no-store\r\nContent-Length: {len(body)}\r\n\r\n").encode() + body
+
+
+def not_found(target):
+    name = target[1:].partition("/")[0]
+    name = name if NAME.match(name) else "NAME"
+    return page("404 Not Found", "No browser", f"No browser for <b>{name}</b> is running on this box. "
+                f"In a tab on the box: <code>box browser {name}</code>.")
+
+
+async def answer(w, data):
+    w.write(data)
+    await w.drain()
+    w.close()
+
+
+async def serve(r, w, projects):
+    try:
+        head = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 30)
+    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ConnectionError):
+        w.close()
+        return
+    lines = head.split(b"\r\n")
+    parts = lines[0].split(b" ")
+    target = parts[1].decode("latin-1") if len(parts) == 3 else ""
+    headers = {}
+    for l in lines[1:]:
+        k, sep, v = l.decode("latin-1").partition(":")
+        if sep:
+            headers[k.strip().lower()] = v.strip()
+    upgrade = "upgrade" in headers
+    if not allowed(headers, upgrade):
+        return await answer(w, page("403 Forbidden", "Not here", "This address only works as localhost."))
+    path, _, query = target.partition("?")
+    m = re.fullmatch(r"/([^/]+)/open", path)
+    if m and NAME.match(m.group(1)):
+        token = urllib.parse.parse_qs(query).get("t", [""])[0]
+        to = projects.opening(m.group(1), token)
+        if not to:
+            return await answer(w, page("403 Forbidden", "Link expired", "This link has expired or isn't valid: "
+                                        f"run <code>box browser {m.group(1)}</code> in a tab on the box again."))
+        return await answer(w, f"HTTP/1.1 302 Found\r\nLocation: {to}\r\nCache-Control: no-store\r\n"
+                            "Content-Length: 0\r\nConnection: close\r\n\r\n".encode())
+    found = route(target, projects.view_port)
+    if not found:
+        return await answer(w, not_found(target))
+    port, rest = found
+    try:
+        br, bw = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", port), 10)
+    except (OSError, asyncio.TimeoutError):
+        return await answer(w, not_found(target))
+    # One request per connection (the next one may be for another project): "close", unless
+    # it's the WebSocket, which stays a plain pipe after this.
+    keep = [l for l in lines[1:] if l and (upgrade or not l.lower().startswith(b"connection:"))]
+    first = b" ".join([parts[0], rest.encode("latin-1"), parts[2]])
+    bw.write(b"\r\n".join([first, *keep, *([] if upgrade else [b"Connection: close"])]) + b"\r\n\r\n")
+    await bw.drain()
+    await asyncio.gather(pipe(r, bw), pipe(br, w))
+
+
+async def main(port, state_dir):
+    projects = Projects(state_dir)
+    server = await asyncio.start_server(lambda r, w: serve(r, w, projects), "127.0.0.1", port, limit=2 ** 16)
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    asyncio.run(main(int(sys.argv[1]), sys.argv[2]))

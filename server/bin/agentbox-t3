@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""agentbox's part of T3 Code's service settings (~/.t3/service.env), for BOX_T3=1.
+
+T3 Code reads KEY=VALUE lines from service.env (literal values, no shell) when its service
+starts. agentbox owns one marked block there: the box-wide variables tab sessions get from
+~/.config/agentbox/env.sh, MCP_OAUTH_CALLBACK_PORT, and T3CODE_LAN=true (phone and browser pair
+over the tailnet). Every other line is the user's or T3 Code's and is kept, except a line
+setting a key the block owns, which the block replaces. No secret ever goes here: the Claude
+sign-in comes from the claude wrapper and the RAM cache.
+
+  agentbox-t3 env FILE KEY=VALUE...   write the block; prints "changed" or "unchanged"
+"""
+import os
+import sys
+
+BEGIN = "# agentbox: begin (box sync rewrites this block; put your own settings outside it)"
+END = "# agentbox: end"
+
+
+def key_of(line):
+    s = line.strip()
+    if not s or s.startswith("#") or "=" not in s:
+        return None
+    return s.split("=", 1)[0].strip().removeprefix("export ").strip()
+
+
+def merged(text, pairs):
+    """The file's new text: the user's lines (less keys the block owns), then the block."""
+    owned = {k for k, _ in pairs}
+    keep, inside = [], False
+    for line in text.splitlines():
+        if line.strip() == BEGIN:
+            inside = True
+            continue
+        if inside:
+            inside = line.strip() != END
+            continue
+        if key_of(line) in owned:
+            continue
+        keep.append(line)
+    while keep and not keep[-1].strip():
+        keep.pop()
+    block = [BEGIN] + [f"{k}={quote(v)}" for k, v in pairs] + [END]
+    return "\n".join(keep + ([""] if keep else []) + block) + "\n"
+
+
+def quote(v):
+    return f'"{v}"' if any(c in v for c in ' #"\'') else v
+
+
+def write_env(path, pairs):
+    try:
+        with open(path) as fh:
+            old = fh.read()
+    except FileNotFoundError:
+        old = ""
+    new = merged(old, pairs)
+    if new == old:
+        return False
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".agentbox"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(new)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+    return True
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[0] == "env":
+        pairs = []
+        for a in argv[2:]:
+            k, sep, v = a.partition("=")
+            if not sep or not k:
+                print(f"not KEY=VALUE: {a}", file=sys.stderr)
+                return 2
+            pairs.append((k, v))
+        print("changed" if write_env(argv[1], pairs) else "unchanged")
+        return 0
+    print(__doc__.split("\n\n")[-1], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

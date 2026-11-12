@@ -1,0 +1,1377 @@
+#!/usr/bin/env bash
+# agentbox from your laptop: one command for the whole day.
+#   box open [BOX|--all]     reconnect the running boxes, one tab per session; with several boxes a
+#                            closed one starts only when named (--all: every box closed with sessions)
+#   box new [NAME|OWNER/REPO] [--as LABEL] [--agent codex] [--box BOX] [--yes]  a new conversation in a new tab (a repo is cloned first)
+#   box attach [NAME] [--agent codex] [--yes]        open a project in a tab (resumes its conversation)
+#   box attach NAME --resume ID [--as LABEL]  another session NAME+LABEL resuming that conversation
+#   box ls [--json]          boxes, costs, load, projects and their sessions (also: box status)
+#   box ssh [PROJECT|BOX]   a plain shell in a project's folder on its box, or on a box
+#   box browser [NAME] [--via-laptop] [--persist] [--stop]  the project's browser on its box, in a
+#                            page on this laptop: sign in to a site, then the agents work there
+#   box names [BOX]          give running sessions their short names BOX/SESSION now (messaging on)
+#   box stop [SESSION] [--yes]           end one session (its conversation stays saved)
+#   box resize TYPE [BOX] [--yes] [--force]  change the server type now, keeping the disk (1-2 min)
+#   box prices | plan [BOX] | budget [TYPE]  price table / what open would pick / the most you'll pay
+#   box close [BOX...|--idle] [--force]  save sessions, snapshot, delete the box(es): stops the cost
+#   box move [PROJECT] --to BOX|new [--yes] [--force]  move a project (files, conversations) to another box
+#                                        (--force: even while agents outside the tabs are working)
+#   box login codex [--box BOX]          sign in to Codex on a box with your ChatGPT account (once)
+#                                        (login acts on --box, else the box of the project you are in, else the box that is up)
+#   box login aws [PROFILE] [--box BOX]  your AWS SSO config (no keys) + a device-code login on the box
+#   box t3 pair [BOX]                    pair a phone or browser with a box's T3 Code (BOX_T3=1; in your terminal)
+#   box add PATH [NAME] [--box BOX] [--yes]  bring a laptop project or workspace to a box (clones its repos)
+#   box check [PATH|NAME]    what would not move: unpushed work, data, .env reads
+#   box sync [NAME] [--pull-setup|--push-setup]  project memory both ways; your agent setup onto the box
+#   box data NAME PATH copy|move-to-box|move-to-laptop   move data that isn't in git
+#   box session push|pull [NAME[/WORKTREE]] [--last|--all|--id ID] [--dry-run|--fix] [--force]  carry the conversations you pick
+#   box session ls [NAME]    each side's conversations: id, last change, size, title
+#   box doctor [--json]      check every prerequisite; says what only you can do and what an agent can
+#   box setup                guided setup for the parts only you can do (run it in your own terminal)
+#   box tick                 idle warnings, and closing idle boxes if BOX_AUTO_CLOSE_HOURS is set
+# Leave out a NAME, BOX or PROFILE to choose it from a list.
+# With BOX_MAX_BOXES=1 (the default) there is one box, "agentbox". With more,
+# projects go on a running box with room for their memory estimates; opening or
+# creating a box asks first (--yes without a terminal).
+set -euo pipefail
+BOX_REPO="$(dirname "$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$0")")"
+source "$BOX_REPO/lib.sh"
+# One lock owner per run (not per laptop), so two runs on this laptop exclude each other too.
+export AGENTBOX_LOCK_ID="${AGENTBOX_LOCK_ID:-$(hostname | tr -c 'a-z0-9-\n' '-' | cut -c1-30)-$$}"
+projects() { python3 "$BOX_REPO/projects.py" "$@"; }
+pool() { python3 "$BOX_REPO/pool.py" "$@"; }
+
+# Run a step (function or script) for box $1 in a subshell: the helpers there,
+# and child scripts via BOX_NAME, act on that box.
+on_box() { local b="$1"; shift; ( use_box "$b"; "$@" ); }
+# Run a step on several boxes at once; output is prefixed with the box name.
+on_boxes() {
+  local step="$1" b rc=0
+  shift
+  if [ $# -le 1 ]; then on_box "${1:-$POOL}" "$step"; return; fi
+  local -a pids=()
+  for b in "$@"; do
+    { on_box "$b" "$step" 2>&1 | sed -u "s/^/[$b] /"; } &
+    pids+=($!)
+  done
+  for b in "${pids[@]}"; do wait "$b" || rc=1; done
+  return $rc
+}
+# Whether box $NAME has a server, running or not (pool state BOX says what it's doing).
+is_up() { hcloud server describe "$NAME" >/dev/null 2>&1; }
+# Its server's Hetzner status (running, off, ...), or none: cheaper than pool state for polling.
+server_status() { hcloud server describe "$NAME" -o format='{{.Status}}' 2>/dev/null || echo none; }
+wait_running() {
+  for _ in $(seq 60); do [ "$(server_status)" = running ] && return 0; sleep 5; done
+  echo "$NAME didn't finish starting." >&2; return 1
+}
+
+# Choose one of CHOICE...: fzf if installed, else a numbered menu; a single choice is
+# taken as is. Without a terminal (an agent calling), list them and fail, so the
+# caller names one. Prints the choice.
+pick() {  # PROMPT CHOICE...
+  local prompt="$1" c
+  shift
+  [ $# -gt 0 ] || { echo "No ${prompt,,} to choose from." >&2; return 1; }
+  [ $# -gt 1 ] || { echo "$1"; return; }
+  if [ ! -t 0 ] || [ ! -t 2 ]; then
+    echo "Name the ${prompt,,}: $*" >&2
+    return 1
+  fi
+  if command -v fzf >/dev/null; then
+    printf '%s\n' "$@" | fzf --prompt "$prompt> " --height 40% --reverse
+    return
+  fi
+  local PS3="$prompt (number): " chosen=""
+  select c in "$@"; do
+    [ -n "$c" ] && { chosen="$c"; break; }
+  done >&2   # the menu goes to the terminal, the choice to the caller
+  [ -n "$chosen" ] && echo "$chosen"
+}
+pick_project() { mapfile -t _p < <(projects list | cut -f1); pick "Project" "${_p[@]}"; }
+# The box project $1 lives on, or a clear error (not placed in this pool).
+box_of() {
+  local b
+  b=$(pool where "$1")
+  [ -n "$b" ] || { echo "$1 isn't placed on any box of the $POOL pool (box ls shows where projects are)." >&2; return 1; }
+  echo "$b"
+}
+# The registered project whose folder holds the current directory (the deepest one).
+project_here() {
+  projects list | awk -F'\t' -v d="$PWD/" 'index(d, $2 "/") == 1 && length($2) > n {n = length($2); p = $1} END {if (p != "") print p}'
+}
+# The box a per-box command acts on: --box, else the box of the project you're in,
+# else the only box that is up (a choice when several are).
+box_here() {
+  local p
+  [ -z "$ON" ] || { echo "$ON"; return; }
+  p=$(project_here)
+  if [ -n "$p" ]; then box_of "$p"; return; fi
+  pick_box
+}
+pick_box() {  # boxes that are up, each shown with its projects; prints the box name
+  local chosen
+  mapfile -t _b < <(pool boxes | awk -F'\t' '$2 == "up" {p = $5; gsub(/ /, ", ", p); print $1 (p == "" ? "" : "  (" p ")")}')
+  [ ${#_b[@]} -gt 0 ] || { echo "No box is up. Start one with: box open" >&2; return 1; }
+  chosen=$(pick "Box" "${_b[@]}") || return 1
+  echo "${chosen%% *}"
+}
+
+# The registered project a session or path belongs to (its first path segment).
+top_of() { local p="${1%@*}"; p="${p%%+*}"; echo "${p%%/*}"; }
+project_of() { local p; p=$(top_of "$1"); if projects list | cut -f1 | grep -qx "$p"; then echo "$p"; fi; }
+
+# Session name for NAME and an agent: NAME runs Claude, NAME@codex runs Codex.
+# Without --agent, a project's agentbox.json "agent" decides (default claude).
+session_for() {
+  local name="$1" agent="$2" p
+  if [ -z "$agent" ]; then
+    p=$(project_of "$name")
+    [ -z "$p" ] || agent=$(projects get "$p" agent | tr -d '"' | sed 's/^null$//')
+  fi
+  case "${agent:-claude}" in
+    claude) echo "$name" ;;
+    codex) echo "$name@codex" ;;
+    *) echo "Unknown agent '$agent' (claude or codex)" >&2; exit 1 ;;
+  esac
+}
+
+# Options shared by the commands: sets AGENT, YES, ON (--box), TO (--to) and ARGS.
+parse_args() {
+  AGENT=""; YES="${BOX_YES:-0}"; FORCE=0; ON=""; TO=""; RESUME=""; AS=""; ARGS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --agent) AGENT="${2:?--agent needs claude or codex}"; shift 2 ;;
+      --agent=*) AGENT="${1#--agent=}"; shift ;;
+      --yes | -y) YES=1; shift ;;
+      --force) FORCE=1; shift ;;
+      --box) ON="${2:?--box needs a box name}"; shift 2 ;;
+      --to) TO="${2:?--to needs a box name or new}"; shift 2 ;;
+      --resume) RESUME="${2:?--resume needs a conversation id (box session ls NAME)}"; shift 2 ;;
+      --as) AS="${2:?--as needs a short label}"; shift 2 ;;
+      *) ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+account_of() {
+  local p; p=$(project_of "$1")
+  [ -n "$p" ] || return 0
+  projects get "$p" account | tr -d '"' | sed 's/^null$//'
+}
+
+# The personal agent setup (skills, rules, CLAUDE.md, AGENTS.md) onto box $1, if
+# BOX_AGENT_SYNC is on: quick, only differences travel. $2: --pull or --push.
+sync_setup() {
+  [ "$BOX_AGENT_SYNC" = 1 ] || return 0
+  BOX_NAME="$1" python3 "$BOX_REPO/agent_setup.py" sync --agents "$BOX_AGENTS" --quiet ${2:+"$2"} </dev/null || true
+}
+
+# Two-way memory sync for every registered project whose box is running.
+sync_all() {  # [BOX]: only the projects on that box
+  local p b state only="${1:-}"
+  while IFS=$'\t' read -r p b state; do
+    [ -z "$only" ] || [ "$b" = "$only" ] || continue
+    # </dev/null everywhere ssh runs inside a `while read` loop: ssh would read the loop's input.
+    [ "$state" = up ] && BOX_NAME="$b" projects sync "$p" --quiet </dev/null || true
+  done < <(pool registered)
+}
+
+show_pending() {  # work that exists only on the box
+  sed 's/^/  ⚠  /; s/\t/: /' <<< "$1"
+}
+
+warn_idle() {
+  local b h
+  while IFS=$'\t' read -r b h; do
+    if awk "BEGIN { exit !($h >= $BOX_IDLE_WARN_HOURS) }"; then
+      echo "⚠  $b has been idle for ${h}h and is still costing money. Run: box close $b"
+    fi
+  done < <(pool idle)
+}
+
+# --- placement ------------------------------------------------------------------------
+# Every command that may need a box runs: decide (pool plan / move-plan, read-only),
+# consent (bill_gate, the only way to open or create a box on these paths), execute. Each
+# step is a plain command whose failure ends the command (never inside $(...), where set -e
+# doesn't apply), and effects are reported after they happened.
+
+# A value from a plan (pool plan / move-plan output): KEY=VALUE lines; reason= repeats.
+plan_get() { sed -n "s/^$2=//p" <<< "$1" | head -1; }
+plan_reasons() { sed -n 's/^reason=/  /p' <<< "$1"; }
+
+# The one gate for anything that starts billing: opening closed box BOX or creating it.
+# It says what would be billed; with --yes (or REQUESTED: the user's own `box open BOX`)
+# it goes ahead, in a terminal it asks, without one it refuses.
+bill_gate() {  # open|create BOX [requested]
+  local action="$1" b="$2" requested="${3:-}" snapshot plan ok
+  if [ "$action" = open ]; then
+    case "$(pool state "$b")" in
+      off|starting) echo "$b exists already (billed while it does), so opening it costs nothing more." >&2; return 0 ;;
+    esac
+  fi
+  if [ "$action" = open ]; then
+    snapshot=$(on_box "$b" latest_snapshot)
+    plan=$( [ -z "$snapshot" ] || on_box "$b" plan_server "$snapshot" 2>/dev/null || true)
+    echo "Opening $b starts billing:" >&2
+  else
+    plan="A new server: the cheapest type in stock up to $BOX_MAX_TYPE ($(server_types price "$BOX_MAX_TYPE" 2>/dev/null || echo "see box prices")), about 5 minutes to build."
+    echo "Creating $b starts billing:" >&2
+  fi
+  if [ -n "$plan" ]; then sed 's/^/  /' <<< "$plan" >&2; else echo "  (box plan $b shows the type and price)" >&2; fi
+  [ "$YES" != 1 ] && [ -z "$requested" ] || return 0
+  if [ ! -t 0 ]; then
+    echo "Confirm with --yes (agents: only after the user agreed to the cost)." >&2
+    return 1
+  fi
+  read -rp "$([ "$action" = open ] && echo Open || echo Create) $b? [y/N] " ok
+  [[ "$ok" =~ ^[Yy] ]]
+}
+
+# The one gate for anything that ends running agents: sessions on BOX stop, with whatever
+# they're doing (their conversations stay saved). WHAT says which: session names, or a
+# description when they can't be listed yet (a closed box). With --yes it goes ahead, in
+# a terminal it asks, without one it refuses. (bill_gate's sibling, for interruptions.)
+stop_gate() {  # BOX WHAT
+  local b="$1" what="$2" ok
+  [ -n "$what" ] || return 0
+  echo "This ends sessions on $b and whatever they're doing (their conversations stay saved, box attach resumes them): $what" >&2
+  [ "$YES" != 1 ] || return 0
+  if [ ! -t 0 ]; then
+    echo "Confirm with --yes (agents: only after the user agreed)." >&2
+    return 1
+  fi
+  read -rp "End them? [y/N] " ok
+  [[ "$ok" =~ ^[Yy] ]]
+}
+
+# The newest snapshot of box $NAME (empty if none).
+latest_snapshot() {
+  hcloud image list --type snapshot --selector "$LABEL" -o noheader -o columns=id 2>/dev/null | sort -n | tail -1
+}
+
+# Open boxes BOX... (bill_gate passed for each) together; fails naming any that isn't up after.
+open_boxes() {  # BOX...
+  local b failed=()
+  [ $# -gt 0 ] || return 0
+  OPEN_PLAN_SHOWN=1 on_boxes open_one "$@" || true
+  for b in "$@"; do [ "$(on_box "$b" server_status)" = running ] || failed+=("$b"); done
+  [ ${#failed[@]} -eq 0 ] || { echo "${failed[*]} didn't open (see above)." >&2; return 1; }
+}
+
+# Create box BOX (bill_gate passed): the pool lock while setup.sh builds it.
+create_box() {  # BOX
+  local b="$1" outer=""
+  # The caller's EXIT trap (cmd_move's report), kept and run after unlocking.
+  if [ -n "$(trap -p EXIT)" ]; then eval "set -- $(trap -p EXIT)"; outer="$3"; fi
+  pool lock || return 1
+  # shellcheck disable=SC2064  # the caller's command is meant to be fixed in now
+  trap "pool unlock${outer:+; $outer}" EXIT   # Ctrl+C during the build doesn't leave the lock set
+  # Another run may have created it while we asked; then just use it.
+  if ! hcloud server describe "$b" >/dev/null 2>&1; then
+    on_box "$b" "$BOX_REPO/setup.sh" || true
+  fi
+  pool unlock || true
+  if [ -n "$outer" ]; then trap -- "$outer" EXIT; else trap - EXIT; fi
+  on_box "$b" is_up || { echo "$b wasn't created (see above)." >&2; return 1; }
+}
+
+# Put project $1 on a box: decide, ask before billing, open or create, record the label.
+# Sets PLACED_BOX. Returns 1 (having placed nothing) if declined, impossible or failed.
+PLACED_BOX=""
+place_project() {  # NAME
+  local plan action b
+  plan=$(pool plan "$1" ${ON:+--box "$ON"}) || return 1
+  action=$(plan_get "$plan" action)
+  b=$(plan_get "$plan" box)
+  plan_reasons "$plan" >&2
+  case "$action" in
+    use) ;;
+    open) bill_gate open "$b" || return 1; open_boxes "$b" || return 1 ;;
+    create) bill_gate create "$b" || return 1; create_box "$b" || return 1 ;;
+    *) return 1 ;;   # full or error: the reasons said why
+  esac
+  if [ "$(pool where "$1")" != "$b" ]; then
+    pool place "$1" "$b" || return 1
+    echo "$1 is placed on $b." >&2
+  fi
+  PLACED_BOX="$b"
+}
+
+# Clone each repo listed in PATH's agentbox.json into the same layout under ~/work/NAME on
+# BOX (up). Says what it did for each, after doing it; returns 1 if a clone failed.
+clone_repos() {  # NAME PATH BOX
+  local name="$1" path="$2" b="$3" rel slug target clone_failed=0
+  while read -r rel slug; do
+    if [ "$rel" = . ]; then target="$name"; else target="$name/$rel"; fi
+    if [ "$slug" = - ]; then
+      echo "  skip $rel: no GitHub remote (push it to GitHub, or copy it: box data $name $rel copy)"
+      continue
+    fi
+    if on_box "$b" bssh "test -d ~/work/$(printf %q "$target")/.git" </dev/null 2>/dev/null; then
+      echo "  $rel: already on $b"
+      continue
+    fi
+    if on_box "$b" bssh "mkdir -p ~/work/$(printf %q "$(dirname "$target")") \
+      && git clone -q https://github.com/$slug ~/work/$(printf %q "$target") \
+      && cd ~/work/$(printf %q "$target") && { mise install --yes >/dev/null 2>&1 || true; }" </dev/null; then
+      echo "  cloned $slug -> $b:~/work/$target"
+    else
+      echo "  couldn't clone $slug on $b (see above); run box add again to retry" >&2
+      clone_failed=1
+    fi
+  done < <(python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+import projects
+for r in projects.manifest(sys.argv[2]).get("repos", []):
+    print(r["path"], r.get("git") or "-")' "$BOX_REPO" "$path")
+  return "$clone_failed"
+}
+
+# Start NAME's session (with the chosen agent) on box $1 and open its tab.
+# A registered project placed on box $2 whose folder isn't there yet (its clone was declined,
+# failed, or happened on another box) gets its repos cloned first, as box add does.
+ensure_cloned() {  # NAME BOX
+  local p path
+  p=$(project_of "$1"); [ -n "$p" ] || return 0
+  on_box "$2" bssh "test -d ~/work/$(printf %q "$p")" </dev/null 2>/dev/null && return 0
+  path=$(projects list | awk -F'\t' -v p="$p" '$1 == p {print $2}')
+  [ -d "$path" ] || { echo "$p isn't on $2 and its laptop folder ($path) is gone: run box add again." >&2; return 1; }
+  echo "$p isn't on $2 yet: cloning its repos."
+  clone_repos "$p" "$path" "$2"
+}
+
+# Project $2's worktrees on box $1 that sit outside its folder (T3 Code's), relative to ~.
+# A box from before box --worktrees has none to report.
+outside_worktrees_of() {  # BOX PROJECT
+  on_box "$1" bssh "box --worktrees $(printf %q "$2") 2>/dev/null || true" </dev/null 2>/dev/null || true
+}
+
+start_on() {  # BOX NAME [CONVERSATION]
+  local b="$1" name="$2" conversation="${3:-}" session
+  session=$(session_for "$name" "$AGENT")
+  on_box "$b" bssh "$(permission_env)box --start $(printf %q "$session") $(printf %q "$(account_of "$name")") $(printf %q "$conversation")"
+  on_box "$b" "$BOX_REPO/tabs.sh" "$session"
+}
+
+# --- per-box steps (run with on_box / on_boxes, NAME = that box) -------------------------
+open_one() {
+  local snapshot plan state
+  state=$(pool state "$NAME")   # pool.py box_state
+  case "$state" in
+    up) return 0 ;;
+    down|none) ;;   # from its snapshot, below
+    off|starting)
+      # A server that exists but doesn't run: billed already, so no new cost. Sessions a
+      # close saved before it stopped (box --save) come back; tmux didn't survive the stop.
+      if [ "$state" = off ]; then
+        echo "$NAME is switched off (billed all the same); powering it on..."
+        hcloud server poweron "$NAME" >/dev/null || return 1
+      else
+        echo "$NAME is starting; waiting for it..."
+      fi
+      wait_running || return 1
+      "$BOX_REPO/up.sh" || return 1
+      bssh box --restore
+      return ;;
+    *)
+      echo "$NAME is $state$([ "$state" = closing ] && echo " (box close is saving it)"); open it again once that's done." >&2
+      return 1 ;;
+  esac
+  snapshot=$(latest_snapshot)
+  [ -n "$snapshot" ] || { echo "No box $NAME yet. Create one with: $BOX_REPO/setup.sh" >&2; return 1; }
+  plan=$(plan_server "$snapshot")
+  [ -n "${OPEN_PLAN_SHOWN:-}" ] || echo "$plan"   # bill_gate showed it already (open_boxes)
+  if ! grep -q '^Would create' <<< "$plan"; then
+    # Only bigger-disk types in stock: ask (in a terminal) before allowing them.
+    grep -q 'BOX_ALLOW_GROW=1 allows' <<< "$plan" || return 1
+    [ -t 0 ] || { echo "Only bigger-disk types are in stock. Confirm in a terminal: box open $NAME" >&2; return 1; }
+    read -rp "Use a type with a bigger disk? It can't shrink back later. [y/N] " ok
+    [[ "$ok" =~ ^[Yy] ]] || return 1
+    export BOX_ALLOW_GROW=1
+    plan_server "$snapshot"
+  fi
+  "$BOX_REPO/up.sh"
+}
+
+# Refuse (or ask, in a terminal) when the box holds work that isn't on GitHub.
+check_pending() {
+  local pending
+  case "$(server_status)" in
+    none) return 0 ;;
+    running) ;;
+    *) echo "$NAME isn't running, so its work can't be checked for anything unpushed; the snapshot keeps it all." >&2
+       return 0 ;;
+  esac
+  pending=$(bssh 'box --git-status --fetch' 2>/dev/null || true)
+  [ -n "$pending" ] || return 0
+  echo "$NAME holds work that isn't on GitHub (kept in the snapshot, but only there):"
+  show_pending "$pending"
+  [ -t 0 ] || { echo "Push it first, or run: box close $NAME --force" >&2; return 1; }
+  read -rp "Close $NAME anyway? [y/N] " ok
+  [[ "$ok" =~ ^[Yy] ]]
+}
+
+# Agents another program started on box $NAME (T3 Code, a script) that are working now:
+# closing, resizing or moving would stop them mid-turn. Same rule as check_pending: a terminal
+# asks, anything else refuses, --force skips. $1: only those in this folder of the box's home
+# (work/PROJECT, for a move).
+# A box whose box script predates --agents isn't asked (it would start a session by that name).
+BOX_HAS_AGENTS='grep -q -- "--agents)" "$(command -v box)"'
+check_agents() {  # [FOLDER...]
+  local working ok
+  [ "${FORCE:-0}" != 1 ] || return 0
+  [ "$(server_status)" = running ] || return 0
+  local rows
+  # A box that can't be asked might have one: say so rather than go ahead. A box from before
+  # agentbox-agents answers nothing, which is fine.
+  if ! rows=$(bssh "if $BOX_HAS_AGENTS; then box --agents; fi" 2>/dev/null); then
+    echo "Couldn't check $NAME for agents working outside its tabs (no answer over ssh)." >&2
+    echo "Rerun with --force to go ahead without the check." >&2
+    return 1
+  fi
+  working=$(agents_text working "$(printf '%s\n' "$@")" <<< "$rows") || true
+  [ -n "$working" ] || return 0
+  echo "$NAME has agents working outside its tabs, started by another program; this would stop them mid-turn:"
+  echo "$working"
+  [ -t 0 ] || { echo "Let them finish first, or rerun with --force." >&2; return 1; }
+  read -rp "Go ahead anyway? [y/N] " ok
+  [[ "$ok" =~ ^[Yy] ]]
+}
+# box --agents' JSON lines (stdin) as text lines; $1 = working: only the working ones;
+# $2 = only those in this folder of the box's home (work/PROJECT) or below it.
+agents_text() {  # all|working [FOLDERS, one per line]
+  python3 -c '
+import json, sys, time
+only, folders = sys.argv[1], [f for f in sys.argv[2].split("\n") if f.strip("/")]
+def shown(v):   # what the box reports is printed here: no control characters reach the terminal
+    return "".join(c for c in str(v) if c.isprintable()) if v else v
+def ago(ts):
+    if not ts: return "no conversation yet"
+    m = int(time.time() - ts) // 60
+    return f"last change {m}m ago" if m < 60 else f"last change {m // 60}h ago"
+for line in sys.stdin:
+    try:
+        r = json.loads(line)
+    except ValueError:
+        continue
+    where = r.get("folder") or ""
+    if folders and not any("/" + f.strip("/") + "/" in where + "/" for f in folders):
+        continue
+    if only == "working" and not r.get("working"):
+        continue
+    agent, starter, last = shown(r.get("agent")), shown(r.get("starter")), r.get("last")
+    last = last if isinstance(last, (int, float)) else None
+    by = f", started by {starter}" if starter else ""
+    state = "working" if r.get("working") else "idle"
+    where = shown(where) or "(no folder)"
+    print(f"  {agent} in {where} ({state}{by}, {ago(last)})")
+' "$1" "${2:-}"
+}
+
+ls_one() {
+  "$BOX_REPO/status.sh"
+  [ "$(server_status)" = running ] || return 0
+  show_load
+  echo
+  echo "Projects in ~/work:"
+  bssh 'box --ls' | python3 -c '
+import sys, time
+rows = [l.rstrip("\n").split("\t") for l in sys.stdin if l.strip()]
+if not rows:
+    print("  (none yet: box new NAME, box new OWNER/REPO or box add PATH)")
+def ago(ts):
+    if not ts: return "never used"
+    m = int(time.time() - float(ts)) // 60
+    return f"{m}m ago" if m < 60 else f"{m // 60}h ago" if m < 1440 else f"{m // 1440}d ago"
+for row in sorted(rows, key=lambda r: (r[1] != "running", r[0])):
+    name, status, last = row[0], row[1], row[2]
+    agents = row[4] if len(row) > 4 and row[4] else ""
+    dot = "🟢" if status == "running" else "⚪"
+    label = f"{status} ({agents})" if agents else status
+    print(f"  {dot} {name:<20} {label:<22} last activity {ago(last)}")
+'
+  local pending outside
+  outside=$(bssh "$BOX_HAS_AGENTS && box --agents" 2>/dev/null | agents_text all) || true
+  if [ -n "$outside" ]; then
+    echo
+    echo "Agents outside the tabs (started by another program; box close asks before stopping working ones):"
+    echo "$outside"
+  fi
+  pending=$(bssh 'box --git-status' 2>/dev/null || true)
+  if [ -n "$pending" ]; then
+    echo
+    echo "Work that exists only on the box:"
+    show_pending "$pending"
+  fi
+}
+
+# One line on how loaded the box is, and a warning with the biggest memory users
+# when it's short of memory or CPU (from the box-side `box --load`).
+show_load() {
+  local load
+  load=$(bssh 'box --load' 2>/dev/null || true)
+  [ -n "$load" ] || return 0
+  python3 - "$load" <<'PY'
+import json, sys
+l = json.loads(sys.argv[1])
+if "mem_total_mb" not in l:   # the box runs an older box script (up.sh updates it)
+    sys.exit(0)
+gb = lambda mb: f"{mb / 1024:.1f}"
+swap = f", swap {gb(l['swap_used_mb'])} of {gb(l['swap_total_mb'])} GB used" if l.get("swap_total_mb") else ", no swap"
+print(f"Load: {gb(l['mem_avail_mb'])} of {gb(l['mem_total_mb'])} GB memory free{swap}, CPU load {l['load1']:.1f} on {l['cpus']} cores")
+short_mem = (l.get("mem_stall_pct") or 0) >= 10 or l["mem_avail_mb"] < l["mem_total_mb"] * 0.05
+short_cpu = l["load1"] > 2 * l["cpus"]
+if short_mem or short_cpu:
+    why = []
+    if short_mem:
+        why.append(f"short of memory (everything waited {l.get('mem_stall_pct') or 0:.0f}% of the last minute)")
+    if short_cpu:
+        why.append(f"CPU overloaded ({l['load1']:.1f} on {l['cpus']} cores)")
+    print("⚠ The box is " + " and ".join(why) + ", so sessions crawl.")
+    print("  Biggest: " + ", ".join(f"{name} {mb} MB" for mb, name in l["top"]))
+    print("  Stop what isn't needed (box stop SESSION, or ask the session to stop its dev server), or box resize TYPE.")
+PY
+}
+
+# box ls --json: boxes, their load, projects and sessions, for agents.
+ls_json() {
+  local b state type eur projs
+  {
+    while IFS=$'\t' read -r b state type eur projs; do
+      [ -n "$b" ] || continue
+      printf 'box\t%s\t%s\t%s\t%s\t%s\n' "$b" "$state" "$type" "$eur" "$projs"
+      [ "$state" = up ] || continue
+      on_box "$b" bssh 'echo "load	$(box --load)"; box --ls | sed "s/^/project	/"; tmux list-sessions -F "session	#{session_name}	#{session_activity}" 2>/dev/null || true
+        if '"$BOX_HAS_AGENTS"'; then box --agents | sed "s/^/agent	/"; fi' </dev/null 2>/dev/null || true
+    done < <(pool boxes)
+  } | python3 -c '
+import json, sys
+boxes, cur = [], None
+for line in sys.stdin:
+    f = line.rstrip("\n").split("\t")
+    if f[0] == "box":
+        cur = {"name": f[1], "state": f[2], "type": f[3], "eur_per_hour": float(f[4] or 0),
+               "projects_placed": f[5].split(), "load": None, "projects": [], "sessions": [], "agents_outside": []}
+        boxes.append(cur)
+    elif f[0] == "load" and cur:
+        cur["load"] = json.loads(f[1]) if len(f) > 1 and f[1] else None
+    elif f[0] == "project" and cur:
+        cur["projects"].append({"name": f[1], "status": f[2], "last_activity": float(f[3]) if len(f) > 3 and f[3] else None,
+                                "agents": f[5] if len(f) > 5 else ""})
+    elif f[0] == "session" and cur:
+        cur["sessions"].append({"name": f[1], "last_activity": int(f[2])})
+    elif f[0] == "agent" and cur:
+        cur["agents_outside"].append(json.loads(f[1]))
+print(json.dumps({"boxes": boxes}, indent=2))'
+}
+
+# Running sessions on the up boxes, as "box<TAB>session" lines.
+all_sessions() {
+  local b
+  while read -r b; do
+    on_box "$b" bssh 'tmux list-sessions -F "#{session_name}" 2>/dev/null || true' </dev/null | sed "s/^/$b\t/" || true
+  done < <(pool boxes | awk -F'\t' '$2 == "up" {print $1}')
+}
+
+cmd_stop() {  # [SESSION] [--yes]: end one session (its agent and whatever it runs)
+  parse_args "$@"
+  local s="${ARGS[0]:-}" b line
+  if [ -z "$s" ]; then
+    mapfile -t _s < <(all_sessions | cut -f2)
+    s=$(pick "Session" "${_s[@]}") || exit 1
+  fi
+  line=$(all_sessions | awk -F'\t' -v s="$s" '$2 == s' | head -1 || true)
+  [ -n "$line" ] || { echo "No session named $s is running (box ls lists them)." >&2; exit 1; }
+  b="${line%%$'\t'*}"
+  echo "Session $s on $b runs:"
+  on_box "$b" bssh "tmux list-panes -s -t $(printf %q "=$s") -F '  #{pane_current_command} in #{pane_current_path}'" \
+    || { echo "$s has just ended."; return; }
+  stop_gate "$b" "$s" || { echo "Left running."; [ -t 0 ] || exit 1; return; }
+  on_box "$b" bssh "tmux kill-session -t $(printf %q "=$s")"
+  echo "Ended $s on $b."
+}
+
+# box resize TYPE [BOX]: change the server type in place, keeping the disk (so it can go
+# back): save sessions, shut down, change type, start, restore. Tabs reconnect by themselves.
+# Resize through a snapshot, into a location that has the type: what box close + box
+# open would do, with the type forced. A bigger disk than the snapshot's grows for good
+# (open asks first). Tabs reconnect by themselves once the sessions are back.
+resize_by_moving() {  # BOX TYPE CURRENT_TYPE
+  local b="$1" type="$2" cur="$3" a
+  echo "Moving $b means: save sessions, snapshot, delete, and recreate it as a $type where"
+  echo "it's in stock (3-5 minutes, a new public IP; the Tailscale name stays). The sessions resume."
+  if [ "$YES" != 1 ]; then
+    [ -t 0 ] || { echo "Rerun with --yes once the user agrees to move the box." >&2; exit 1; }
+    read -rp "Move $b to another location as a $type? [y/N] " a
+    [[ "$a" == [yY]* ]] || { echo "Nothing changed: $b is still a $cur."; return; }
+  fi
+  on_box "$b" check_pending || exit 1
+  on_box "$b" check_agents || exit 1
+  sync_all "$b"
+  on_box "$b" "$BOX_REPO/down.sh" || { echo "Closing $b failed; it is still a $cur." >&2; exit 1; }
+  BOX_TYPE="$type" on_box "$b" open_one || { echo "Reopening $b as a $type failed; box open $b brings it back as before." >&2; exit 1; }
+  sync_all "$b"
+  echo "$b is now a $type in $(hcloud server describe "$b" -o format='{{.Location.Name}}')."
+}
+
+cmd_resize() {
+  parse_args "$@"
+  local type="${ARGS[0]:-}" b="${ARGS[1]:-}" loc cur disk check ram price a
+  [ -n "$type" ] || { echo "usage: box resize TYPE [BOX]   (box prices lists the types)" >&2; exit 1; }
+  [ -n "$b" ] || b=$(pick_box) || exit 1
+  pool boxes | awk -F'\t' -v b="$b" '$1 == b && $2 == "up" {f=1} END {exit !f}' \
+    || { echo "$b isn't one of this pool's boxes that are up (box ls)." >&2; exit 1; }
+  cur=$(hcloud server describe "$b" -o format='{{.ServerType.Name}}')
+  [ "$cur" != "$type" ] || { echo "$b already is a $type."; return; }
+  loc=$(hcloud server describe "$b" -o format='{{.Location.Name}}')
+  disk=$(hcloud server describe "$b" -o format='{{.PrimaryDiskSize}}')
+  if ! check=$(hcloud server-type list -o json | python3 "$BOX_REPO/server_types.py" check "$type" "$loc" "$disk" 2>&1); then
+    echo "$check" >&2
+    # Not in stock here but elsewhere: a server can't change location, but the box can
+    # move there through a snapshot (close, then open with that type).
+    [[ "$check" == *"isn't in stock in $loc"*"(it is in "* ]] || exit 1
+    resize_by_moving "$b" "$type" "$cur"
+    return
+  fi
+  ram="${check%% *}" price="${check#* }"
+  echo "$b: $cur -> $type ($ram GB RAM, $price), disk kept ($disk GB) so it can go back."
+  echo "Takes 1-2 minutes; the agents are stopped and resume their conversations afterwards."
+  if [ "$YES" != 1 ]; then
+    [ -t 0 ] || { echo "It costs $price while the box runs and interrupts running work. Rerun with --yes once the user agrees." >&2; exit 1; }
+    read -rp "Resize now? [y/N] " a
+    [[ "$a" == [yY]* ]] || { echo "Nothing changed."; return; }
+  fi
+  on_box "$b" check_agents || exit 1
+  # Each step stops on failure. rc: 0 = type changed, 2 = the change failed (box off),
+  # anything else = it couldn't be powered off. Whatever happened, an off box is started again.
+  local rc=0
+  (
+    use_box "$b"
+    bssh 'box --save' || true
+    echo "Shutting down $b..."
+    hcloud server shutdown "$b" >/dev/null || true
+    for _ in $(seq 1 60); do [ "$(hcloud server describe "$b" -o format='{{.Status}}')" = off ] && break; sleep 3; done
+    if [ "$(hcloud server describe "$b" -o format='{{.Status}}')" != off ]; then
+      hcloud server poweroff "$b" >/dev/null || { echo "Couldn't power $b off." >&2; exit 1; }
+    fi
+    echo "Changing $b to $type..."
+    hcloud server change-type --keep-disk "$b" "$type" >/dev/null || { echo "The type change failed." >&2; exit 2; }
+  ) || rc=$?
+  # Once it was shut down, bring everything back (Hetzner may already have started
+  # it after the type change): the token and .env files lived in RAM, sessions in tmux.
+  if [ "$rc" = 0 ] || [ "$rc" = 2 ] || [ "$(hcloud server describe "$b" -o format='{{.Status}}')" != running ]; then
+    (
+      use_box "$b"
+      [ "$(hcloud server describe "$b" -o format='{{.Status}}')" = running ] || hcloud server poweron "$b" >/dev/null
+      echo "Starting $b..."
+      wait_ssh 60 || { echo "$b doesn't answer yet; run up.sh to repair the connection." >&2; exit 1; }
+      push_bws_token
+      bssh 'box --restore'
+    ) || exit 1
+    sync_all "$b"   # .env files (env_files) live in RAM, which the restart emptied
+  fi
+  [ "$rc" = 0 ] || { echo "Nothing changed: $b is still a $cur." >&2; exit 1; }
+  echo "$b is now a $type. AWS logins (box login aws) were in RAM: sign in again if needed."
+  if [ -t 0 ] && [ "${BOX_MIN_RAM%.*}" -lt "${ram%.*}" ]; then
+    read -rp "Keep at least $ram GB on later opens too (BOX_MIN_RAM=$ram in box.conf)? [y/N] " a
+    if [[ "$a" == [yY]* ]]; then
+      mkdir -p "$(dirname "$BOX_CONF")"
+      touch "$BOX_CONF"
+      if grep -q '^BOX_MIN_RAM=' "$BOX_CONF"; then sed -i "s/^BOX_MIN_RAM=.*/BOX_MIN_RAM=$ram/" "$BOX_CONF"; else echo "BOX_MIN_RAM=$ram" >> "$BOX_CONF"; fi
+      echo "Saved: later opens pick the cheapest type with at least $ram GB."
+    fi
+  elif [ "${BOX_MIN_RAM%.*}" -lt "${ram%.*}" ]; then
+    echo "A later box open picks the cheapest type in budget again; BOX_MIN_RAM=$ram in box.conf keeps this size."
+  fi
+}
+
+login_one() {
+  [ "$(server_status)" = running ] || { echo "$NAME isn't running. Start it with: box open $NAME" >&2; return 1; }
+  if bssh 'bash -lc "codex login status"' >/dev/null 2>&1; then
+    echo "Codex on $NAME is already logged in."
+    return
+  fi
+  # Codex signs in through a browser callback on port 1455 of the machine it
+  # runs on, so forward that port and do the sign-in in the laptop's browser.
+  echo "Open the link Codex prints in your browser; the sign-in comes back through this terminal."
+  ssh -t -o ControlPath=none -o ExitOnForwardFailure=yes -L 1455:localhost:1455 "$NAME" 'bash -lc "codex login"'
+}
+
+# AWS SSO on the box: the laptop's ~/.aws/config (profiles and SSO sessions; any
+# key lines are left out), then a device-code sign-in approved in your browser.
+# The tokens live in RAM (/run/agentbox), so sign in again after each open.
+login_aws() {  # [PROFILE]
+  local profile="${1:-}" target sessions check profiles
+  [ "$(server_status)" = running ] || { echo "$NAME isn't running. Start it with: box open $NAME" >&2; return 1; }
+  [ -f "$HOME/.aws/config" ] || { echo "No ~/.aws/config on this laptop; set up SSO here first (aws configure sso)." >&2; return 1; }
+  if [ -n "$profile" ]; then
+    target="--profile $(printf %q "$profile")"
+  else
+    sessions=$(sed -n 's/^\[sso-session \(.*\)\]$/\1/p' "$HOME/.aws/config")
+    if [ -n "$sessions" ] && [ "$(grep -c . <<< "$sessions")" = 1 ]; then
+      target="--sso-session $(printf %q "$sessions")"
+    else
+      mapfile -t _pr < <(sed -n 's/^\[profile \(.*\)\]$/\1/p' "$HOME/.aws/config")
+      profile=$(pick "AWS profile" "${_pr[@]}") || return 1
+      target="--profile $(printf %q "$profile")"
+    fi
+  fi
+  # A profile to test the sign-in with: the one named, or the only one there is.
+  profiles=$(sed -n 's/^\[profile \(.*\)\]$/\1/p' "$HOME/.aws/config")
+  check="$profile"
+  if [ -z "$check" ] && [ -n "$profiles" ] && [ "$(grep -c . <<< "$profiles")" = 1 ]; then check="$profiles"; fi
+  grep -viE '^[[:space:]]*(aws_access_key_id|aws_secret_access_key|aws_session_token)[[:space:]]*=' "$HOME/.aws/config" \
+    | bssh 'mkdir -p ~/.aws && umask 077 && cat > ~/.aws/config'
+  bssh 'set -e; export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+    [ -d /run/agentbox ] || sudo install -d -m 700 -o "$USER" -g "$USER" /run/agentbox
+    for d in sso cli; do
+      mkdir -p "/run/agentbox/aws/$d-cache" ~/.aws/$d
+      if [ -d ~/.aws/$d/cache ] && [ ! -L ~/.aws/$d/cache ]; then   # an earlier sign-in on disk: keep it, in RAM
+        cp -a ~/.aws/$d/cache/. "/run/agentbox/aws/$d-cache/" 2>/dev/null || true
+        rm -rf ~/.aws/$d/cache
+      fi
+      ln -sfn "/run/agentbox/aws/$d-cache" ~/.aws/$d/cache
+    done
+    command -v aws >/dev/null || { echo "Installing the AWS CLI..."; mkdir -p ~/.config/mise/conf.d
+      printf "[tools]\n\"aws-cli\" = \"2\"\n" > ~/.config/mise/conf.d/agentbox-aws.toml; mise install --yes >/dev/null; }'
+  if [ -n "$check" ] && bssh "export PATH=\"\$HOME/.local/share/mise/shims:\$PATH\"; aws sts get-caller-identity --profile $(printf %q "$check") >/dev/null 2>&1"; then
+    echo "AWS on $NAME is already signed in (profile $check)."
+    return
+  fi
+  echo "Open the link below in your browser and approve; this waits until you do."
+  bssh "export PATH=\"\$HOME/.local/bin:\$HOME/.local/share/mise/shims:\$PATH\"; aws sso login $target --use-device-code --no-browser" || return 1
+  [ -z "$check" ] || bssh "export PATH=\"\$HOME/.local/share/mise/shims:\$PATH\"; aws sts get-caller-identity --profile $(printf %q "$check") --query Arn --output text"
+}
+
+# --- commands ---------------------------------------------------------------------------
+cmd_open() {  # [BOX | --all] [--yes]
+  local -a boxes=() down=()
+  local b state projects opened=0 answer requested="" named=""
+  parse_args "$@"
+  set -- ${ARGS[@]+"${ARGS[@]}"}
+  case "${1:-}" in
+    --all)   # every box closed with sessions, plus the running ones (reconnected)
+      while IFS= read -r b; do [ -n "$b" ] && boxes+=("$b"); done < <(pool reopen)
+      while IFS=$'\t' read -r b state _; do [ "$state" = up ] && boxes+=("$b"); done < <(pool boxes) ;;
+    "") ;;
+    *) boxes=("$1"); requested=1; named=1 ;;   # named: that is the user's request to open it
+  esac
+  if [ -z "${1:-}" ] && [ "$BOX_MAX_BOXES" -le 1 ]; then
+    while IFS= read -r b; do [ -n "$b" ] && boxes+=("$b"); done < <(pool reopen)
+  elif [ -z "${1:-}" ]; then
+    # Several boxes: reconnect the ones that are up; a closed one starts billing,
+    # so it opens only when named (box open BOX) or chosen here.
+    while IFS=$'\t' read -r b state _ _ projects; do
+      case "$state" in
+        up) boxes+=("$b") ;;
+        down) down+=("$b${projects:+ ($projects)}") ;;
+        *) echo "$b is $state; not opened ($(box_state_hint "$state" "$b"))." ;;
+      esac
+    done < <(pool boxes)
+    if [ ${#boxes[@]} -eq 0 ] && [ ${#down[@]} -gt 0 ]; then
+      if [ -t 0 ] && [ -t 2 ]; then
+        if [ ${#down[@]} -eq 1 ]; then
+          read -rp "No box is up. Open ${down[0]}? It bills while it runs. [y/N] " answer
+          [[ "$answer" == [yY]* ]] || exit 0
+          b="${down[0]}"
+        else
+          b=$(pick "Box to open (it bills while it runs)" "${down[@]}") || exit 1
+        fi
+        boxes=("${b%% *}")
+        requested=1   # chosen just now
+      else
+        echo "No box is up. Open one with box open BOX (or box open --all):" >&2
+        printf '  %s\n' "${down[@]}" >&2
+        exit 1
+      fi
+    elif [ ${#down[@]} -gt 0 ]; then
+      echo "Closed, not opened (box open BOX to open one): ${down[*]}"
+    fi
+  fi
+  [ ${#boxes[@]} -gt 0 ] || boxes=("$POOL")
+  # Typed in a terminal, box open (--all) is the user's request; a caller without one (an
+  # agent) needs --yes for boxes it didn't name.
+  [ -n "$requested" ] || [ ! -t 0 ] || requested=1
+  local closed=()
+  local st skipped=0
+  for b in "${boxes[@]}"; do
+    st=$(pool state "$b")
+    case "$st" in
+      up) continue ;;
+      off|starting) closed+=("$b") ;;   # billed already: open_one powers it on or waits
+      down|none) bill_gate open "$b" "$requested" || exit 1; closed+=("$b") ;;
+      *) echo "$b is $st; not opened ($(box_state_hint "$st" "$b"))." >&2; skipped=1 ;;
+    esac
+  done
+  # The box the user named can't be opened now: that's a failure, not a reconnect.
+  [ "$skipped" = 0 ] || [ -z "$named" ] || exit 1
+  open_boxes ${closed[@]+"${closed[@]}"} || exit 1
+  sync_all
+  while IFS=$'\t' read -r b state _; do
+    [ "$state" = up ] || continue
+    on_box "$b" "$BOX_REPO/tabs.sh" </dev/null 2>/dev/null && opened=1
+  done < <(pool boxes)
+  if [ "$opened" = 0 ]; then
+    echo "No sessions running; opening a tab on the project picker."
+    on_box "${boxes[0]}" "$BOX_REPO/tabs.sh" main
+  fi
+}
+
+cmd_new() {
+  parse_args "$@"
+  local target="${ARGS[0]:-}" name b id session
+  [ -n "$target" ] || target=$(pick_project) || exit 1
+  if [[ "$target" == */* ]] && [ -z "$(project_of "$target")" ]; then
+    name="${ARGS[1]:-$(basename "$target" .git)}"
+    place_project "$name" || exit 1
+    b="$PLACED_BOX"
+    on_box "$b" bssh "box clone $(printf %q "$target") $(printf %q "$name")" >/dev/null
+    echo "Cloned $target on $b."
+  else
+    name="$target"
+    place_project "$(top_of "$name")" || exit 1
+    b="$PLACED_BOX"
+    ensure_cloned "$name" "$b" || exit 1
+  fi
+  sync_setup "$b"
+  # Always a new conversation, started with an id chosen here so the session keeps
+  # it (reconnects, close/open). In session NAME if that isn't running, else NAME+LABEL.
+  id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+  session=$(session_for "$name" "$AGENT")
+  if [ -n "$AS" ] || on_box "$b" bssh "tmux has-session -t $(printf %q "=$session")" 2>/dev/null; then
+    name="$(top_of "$name")+${AS:-${id:0:8}}"
+  fi
+  start_on "$b" "$name" "$id"
+}
+
+cmd_attach() {
+  parse_args "$@"
+  local name="${ARGS[0]:-}" p b note
+  [ -n "$name" ] || name=$(pick_project) || exit 1
+  place_project "$(top_of "$name")" || exit 1
+  b="$PLACED_BOX"
+  ensure_cloned "$name" "$b" || exit 1
+  p=$(project_of "$name")
+  [ -z "$p" ] || BOX_NAME="$b" projects sync "$p" --quiet
+  sync_setup "$b"
+  note=$( [ -z "$p" ] || projects get "$p" laptop_only | sed 's/^null$//; s/^"//; s/"$//')
+  [ -z "$note" ] || echo "Note: $p is marked laptop only: $note" >&2
+  if [ -n "$RESUME" ]; then
+    # Another session in the same folder, resuming that conversation: NAME+LABEL.
+    local ids conversation
+    ids=$(on_box "$b" bssh "box --conversation $(printf %q "$(top_of "$name")") $(printf %q "$RESUME")")
+    [ "$(grep -c . <<< "$ids")" = 1 ] && [ -n "$ids" ] \
+      || { echo "No single conversation of $(top_of "$name") on $b starts with $RESUME (see: box session ls $(top_of "$name"))." >&2; exit 1; }
+    conversation="$ids"
+    name="$(top_of "$name")+${AS:-${conversation:0:8}}"
+    start_on "$b" "$name" "$conversation"
+    return
+  fi
+  start_on "$b" "$name"
+}
+
+cmd_sync() {  # [NAME] [--pull-setup|--push-setup]: memory and settings, and the agent setup
+  local name="" mode="" b
+  for a in "$@"; do
+    case "$a" in
+      --pull-setup) mode=--pull ;;
+      --push-setup) mode=--push ;;
+      *) name="$a" ;;
+    esac
+  done
+  if [ -n "$name" ]; then
+    b=$(box_of "$name") || exit 1
+    BOX_NAME="$b" projects sync "$name"
+    sync_setup "$b" "$mode"
+  else
+    sync_all
+    while IFS=$'\t' read -r b state _; do [ "$state" = up ] && sync_setup "$b" "$mode"; done < <(pool boxes)
+    echo "Synced all projects."
+  fi
+}
+
+cmd_session() {  # push|pull|ls [NAME[/WORKTREE]] [options]
+  local action="${1:?usage: box session push|pull|ls [NAME[/WORKTREE]] [options]}" name=""
+  shift
+  if [ $# -gt 0 ] && [[ "$1" != -* ]]; then name="$1"; shift; fi
+  [ -n "$name" ] || name=$(pick_project) || exit 1
+  local b
+  b=$(box_of "$(top_of "$name")") || exit 1
+  BOX_NAME="$b" python3 "$BOX_REPO/sessions.py" "$action" "$name" "$@"
+}
+
+# Give the running sessions their short names BOX/SESSION now (messaging on): sessions started
+# before agentbox kept names get theirs only on their next rename or start otherwise. On each
+# box, agentbox-name types the /rename once a session is idle with nothing typed.
+cmd_names() {  # [BOX]
+  local b state any=0
+  while IFS=$'\t' read -r b state _; do
+    [ "$state" = up ] || continue
+    [ -z "${1:-}" ] || [ "$b" = "$1" ] || continue
+    any=1
+    echo "$b:"
+    on_box "$b" bssh 'if command -v agentbox-name >/dev/null; then agentbox-name keep-all; else echo "  (this box runs an older agentbox: sync it with up.sh first)"; fi' </dev/null \
+      | sed 's/^/  /' || echo "  ⚠  couldn't reach $b"
+  done < <(pool boxes)
+  [ "$any" = 1 ] || echo "No box${1:+ named $1} is up." >&2
+}
+
+cmd_ssh() {  # [PROJECT|BOX]: a plain shell in a project's folder on its box, or on a box
+  local t="${1:-}" p b
+  [ -n "$t" ] || t=$(pick_project) || exit 1
+  if pool boxes | cut -f1 | grep -qx -- "$t"; then
+    ssh -t "$t"
+    return
+  fi
+  p=$(project_of "$t")
+  [ -n "$p" ] || { echo "No project or box named $t." >&2; exit 1; }
+  b=$(box_of "$p") || exit 1
+  [ "$(pool boxes | awk -F'\t' -v b="$b" '$1 == b {print $2}')" = up ] \
+    || { echo "$p is on $b, which is down. Start it with: box open $b" >&2; exit 1; }
+  ssh -t "$b" "cd ~/work/$(printf %q "$p") && exec bash -l"
+}
+
+# The project's browser on its box (agentbox-browser there), shown in a page on this laptop
+# through an ssh tunnel that runs in the background. --via-laptop sends the browser's
+# traffic out through this laptop (sites that refuse server addresses); --persist keeps
+# its sign-ins on the box's disk. The agents' browser tools use the same browser.
+cmd_browser() {  # [NAME] [--via-laptop] [--persist] [--stop]
+  local name="" stop=0 via="$BOX_BROWSER_VIA_LAPTOP" persist=0 a b out view proxy profile password lp dir tf url
+  local pid="" old_lp="" old_view="" old_proxy=""
+  for a in "$@"; do
+    case "$a" in
+      --stop) stop=1 ;;
+      --via-laptop) via=1 ;;
+      --no-via-laptop) via=0 ;;
+      --persist) persist=1 ;;
+      -*) echo "unknown option $a (box browser [NAME] [--via-laptop] [--persist] [--stop])" >&2; exit 1 ;;
+      *) name="$a" ;;
+    esac
+  done
+  [ -n "$name" ] || name=$(pick_project) || exit 1
+  name=$(top_of "$name")
+  b=$(box_of "$name") || exit 1
+  [ "$(pool boxes | awk -F'\t' -v b="$b" '$1 == b {print $2}')" = up ] \
+    || { echo "$name is on $b, which is down. Start it with: box open $b" >&2; exit 1; }
+  dir="${XDG_CACHE_HOME:-$HOME/.cache}/agentbox/browser"
+  mkdir -p "$dir"
+  tf="$dir/$b-$name.tunnel"   # the tunnel loop of this box and project: pid, local port, ports on the box
+  if [ -f "$dir/$b-$name.pid" ]; then   # a plain ssh tunnel from before the loop (0.24.0's first build)
+    kill "$(head -1 "$dir/$b-$name.pid")" 2>/dev/null || true
+    rm -f "$dir/$b-$name.pid"
+  fi
+  if [ -f "$tf" ]; then
+    pid=$(sed -n 's/^pid=//p' "$tf"); old_lp=$(sed -n 's/^port=//p' "$tf")
+    old_view=$(sed -n 's/^view=//p' "$tf"); old_proxy=$(sed -n 's/^proxy=//p' "$tf")
+    tunnel_pid_ok "$pid" "$b" "$name" || pid=""
+  fi
+  if [ "$stop" = 1 ]; then
+    stop_tunnel "$tf" "$pid"
+    on_box "$b" bssh "agentbox-browser stop $(printf %q "$name")"
+    echo "Stopped the browser for $name on $b."
+    return
+  fi
+  [ "$(projects get "$name" browser 2>/dev/null | python3 -c 'import json, sys
+d = json.loads(sys.stdin.read() or "null")
+print(1 if isinstance(d, dict) and d.get("persist") else 0)' 2>/dev/null)" = 1 ] && persist=1
+  # Without --via-laptop or --no-via-laptop (or BOX_BROWSER_VIA_LAPTOP), the project keeps
+  # its choice, so reopening the viewer never restarts the browser.
+  out=$(on_box "$b" bssh "agentbox-browser start $(printf %q "$name")$([ "$persist" = 1 ] && echo ' --persist')$(
+    case "$via" in 1) echo ' --proxy' ;; 0) echo ' --no-proxy' ;; esac)") || exit 1
+  view=$(sed -n 's/^view=//p' <<< "$out"); proxy=$(sed -n 's/^proxy=//p' <<< "$out")
+  profile=$(sed -n 's/^profile=//p' <<< "$out"); password=$(sed -n 's/^password=//p' <<< "$out")
+  # A running tunnel for the same ports is kept (an open page stays connected); otherwise a
+  # new one, on the same local port when it can, so a page that is already open reconnects.
+  if [ -n "$pid" ] && [ "$view" = "$old_view" ] && [ "$proxy" = "$old_proxy" ] \
+      && port_open "$old_lp"; then
+    lp="$old_lp"
+  else
+    stop_tunnel "$tf" "$pid"
+    lp="$old_lp"
+    if [ -z "$lp" ] || port_open "$lp"; then
+      lp=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+    fi
+    # In its own session where setsid exists (Linux), so closing this terminal or Ctrl+C
+    # here doesn't end it; macOS has no setsid, and nohup keeps it through a closed terminal.
+    local -a loop=("$BOX_REPO/box" --browser-tunnel "$b" "$name" "$lp" "$view" "$proxy" "$tf")
+    if command -v setsid >/dev/null; then
+      BOX_NAME="$NAME" setsid "${loop[@]}" </dev/null >"$dir/$b-$name.log" 2>&1 &
+    else
+      BOX_NAME="$NAME" nohup "${loop[@]}" </dev/null >"$dir/$b-$name.log" 2>&1 &
+    fi
+    pid=$!
+    disown 2>/dev/null || true
+    printf 'pid=%s\nport=%s\nview=%s\nproxy=%s\n' "$pid" "$lp" "$view" "$proxy" > "$tf"
+    for _ in $(seq 75); do
+      port_open "$lp" && break
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.2
+    done
+    if ! port_open "$lp"; then
+      echo "The tunnel to $b didn't come up: $(tail -3 "$dir/$b-$name.log")" >&2
+      stop_tunnel "$tf" "$pid"
+      exit 1
+    fi
+    # The tunnel's box end (the SOCKS port) comes up a moment after its laptop end.
+    if [ -n "$proxy" ]; then
+      on_box "$b" bssh "for _ in \$(seq 25); do (exec 3<>/dev/tcp/127.0.0.1/$proxy) 2>/dev/null && exit 0; sleep 0.4; done; exit 1" \
+        || echo "Warning: the way out through this laptop isn't up on $b yet; pages may show a proxy error (see $dir/$b-$name.log)." >&2
+    fi
+  fi
+  url="http://localhost:$lp/vnc.html?autoconnect=1&resize=scale&reconnect=1&password=$password"
+  echo "The browser for $name on $b: $url"
+  open_url "$url" || echo "Open that address in your browser."
+  if [ "$profile" = disk ]; then
+    echo "Sign-ins are kept on $b's disk (and in its snapshots) until: box browser $name --stop, then delete ~/.local/share/agentbox/browser/$name there."
+  else
+    echo "Sign-ins live in RAM on $b: they're gone after box browser $name --stop or box close."
+  fi
+  if [ -n "$proxy" ]; then
+    echo "Its traffic goes out through this laptop while the tunnel runs; without it, pages show a proxy error (box browser $name --no-via-laptop to stop that)."
+  fi
+  echo "The tunnel reconnects by itself after a dropped connection (log: $dir/$b-$name.log)."
+  echo "Sign in, then tell the session. The agents' browser tools use this same browser. Stop it (frees ~300-500 MB): box browser $name --stop"
+}
+
+# PID is the tunnel loop of BOX and NAME (a pid in a file that outlived a reboot may be
+# someone else's by now).
+tunnel_pid_ok() {  # PID BOX NAME
+  [ -n "$1" ] && kill -0 "$1" 2>/dev/null \
+    && [[ " $(ps -o args= -p "$1" 2>/dev/null) " == *" --browser-tunnel $2 $3 "* ]]
+}
+
+# End a viewer tunnel loop (TUNNEL_FILE PID) and wait until its ssh has let go of the ports.
+stop_tunnel() {
+  local tf="$1" pid="$2"
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  fi
+  rm -f "$tf"
+}
+
+# What box browser leaves running: the viewer tunnel (and the SOCKS forward of --via-laptop),
+# reconnected after a dropped connection like a session tab, on the same local port so an
+# open page comes back by itself. It ends when the project's browser was stopped on the box
+# or restarted with a new viewer (the open page's password no longer fits), and gives up when
+# no connection has lasted for BOX_BROWSER_TUNNEL_GIVEUP seconds, backing off meanwhile.
+browser_tunnel() {  # BOX NAME LOCAL_PORT VIEW_PORT PROXY_PORT TUNNEL_FILE
+  local b="$1" name="$2" lp="$3" view="$4" proxy="${5:-}" tf="${6:-}" conn="" nap="" st rc started
+  local failing_since="" pause=0 giveup="$BOX_BROWSER_TUNNEL_GIVEUP" first="$BOX_BROWSER_TUNNEL_RETRY" v p
+  tlog() { echo "$(date '+%F %T') $*"; }
+  trap '[ -z "$conn" ] || kill "$conn" 2>/dev/null; [ -z "$nap" ] || kill "$nap" 2>/dev/null
+        tlog "tunnel stopped"; exit 0' TERM INT HUP
+  tlog "tunnel for $name: localhost:$lp -> $b:$view${proxy:+, SOCKS $b:$proxy through this laptop}"
+  while :; do
+    local -a cmd=(ssh -N -o ControlPath=none -o BatchMode=yes -o ExitOnForwardFailure=yes -o LogLevel=ERROR
+                  -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ConnectTimeout=10
+                  -L "localhost:$lp:127.0.0.1:$view")   # IPv4 and IPv6: Windows tries ::1 first and waits it out
+    [ -n "$proxy" ] && cmd+=(-R "127.0.0.1:$proxy")
+    started=$SECONDS
+    "${cmd[@]}" "$b" </dev/null &
+    conn=$!
+    # The local end listens once ssh is connected and its forwards are accepted.
+    for _ in $(seq 30); do
+      kill -0 "$conn" 2>/dev/null || break
+      if port_open "$lp"; then tlog "connected"; break; fi
+      sleep 0.5
+    done
+    rc=0; wait "$conn" || rc=$?
+    conn=""
+    tlog "connection to $b ended (ssh exit $rc)"
+    # A connection that lasted counts as working; one that ends at once (box unreachable, a
+    # forward refused) counts towards giving up, with longer pauses each time.
+    if (( SECONDS - started >= 30 )); then failing_since=""; pause=0; else failing_since=${failing_since:-$started}; fi
+    # Is the browser still there, on the same viewer?
+    rc=0
+    st=$(timeout 20 ssh -o ControlPath=none -o BatchMode=yes -o ConnectTimeout=10 -o LogLevel=ERROR \
+      -o ServerAliveInterval=5 -o ServerAliveCountMax=2 "$b" \
+      "agentbox-browser status $(printf %q "$name")" </dev/null 2>/dev/null) || rc=$?
+    if [ "$rc" = 0 ]; then
+      if [ -z "$st" ]; then tlog "the browser for $name was stopped on $b; tunnel ends"; exit 0; fi
+      v=$(sed -n 's/.*view=\([0-9]*\).*/\1/p' <<< "$st"); p=$(sed -n 's/.*proxy=\([0-9]*\).*/\1/p' <<< "$st")
+      if [ "$v" != "$view" ]; then
+        tlog "the browser for $name was restarted on $b; tunnel ends (box browser $name opens it again)"
+        exit 0
+      fi
+      if [ "$p" != "$proxy" ]; then
+        proxy="$p"
+        [ -z "$tf" ] || sed -i.bak "s/^proxy=.*/proxy=$proxy/" "$tf" 2>/dev/null && rm -f "$tf.bak"
+      fi
+    else
+      failing_since=${failing_since:-$started}
+    fi
+    if [ -n "$failing_since" ] && (( SECONDS - failing_since >= giveup )); then
+      local for_s=$(( SECONDS - failing_since ))
+      tlog "no working connection to $b for $( ((for_s < 120)) && echo "$for_s s" || echo "$((for_s / 60)) min"); giving up (box browser $name starts it again)"
+      exit 0
+    fi
+    # Retry soon after a drop, then back off while it keeps failing (up to a minute).
+    if [ -z "$failing_since" ] || [ "$pause" = 0 ]; then pause="$first"; else pause=$(( pause * 2 > 60 ? 60 : pause * 2 )); fi
+    sleep "$pause" &
+    nap=$!
+    wait "$nap" || true
+    nap=""
+  done
+}
+
+cmd_login() {
+  local b
+  parse_args "$@"
+  case "${ARGS[0]:-}" in codex | aws) b=$(box_here) || exit 1 ;; esac
+  case "${ARGS[0]:-}" in
+    codex) on_box "$b" login_one ;;
+    aws) on_box "$b" login_aws "${ARGS[1]:-}" ;;
+    *) echo "usage: box login codex|aws [PROFILE] [--box BOX]" >&2; exit 1 ;;
+  esac
+}
+
+# T3 Code on the boxes (BOX_T3=1). `pair` shows a box's one-time pairing link and QR code for a
+# phone or browser on the tailnet. The link is a credential (5 minutes), so it's shown only on
+# the user's own terminal: never where an agent would relay it into a conversation.
+cmd_t3() {
+  local b
+  parse_args "$@"
+  [ "${ARGS[0]:-}" = pair ] || { echo "usage: box t3 pair [BOX]" >&2; exit 1; }
+  [ "$BOX_T3" = 1 ] || { echo "T3 Code isn't set up on the boxes: set BOX_T3=1 in box.conf; it applies as a box opens (or run up.sh for a running one)." >&2; exit 1; }
+  if [ -n "${ARGS[1]:-}" ]; then b="${ARGS[1]}"; else b=$(box_here) || exit 1; fi
+  [ "$(on_box "$b" server_status)" = running ] || { echo "$b isn't running. Open it first: box open $b" >&2; exit 1; }
+  on_box "$b" bssh 'bash -lc "command -v t3"' >/dev/null 2>&1 \
+    || { echo "T3 Code isn't installed on $b yet: run BOX_NAME=$b ./up.sh in the agentbox folder." >&2; exit 1; }
+  [ -t 0 ] && [ -t 1 ] || { echo "The pairing link is a credential: run box t3 pair in your own terminal." >&2; exit 1; }
+  echo "Pair a phone or browser on your tailnet with $b's T3 Code (the link works for 5 minutes):"
+  on_box "$b" pair_t3
+}
+pair_t3() { ssh -t -o ControlPath=none "$NAME" 'bash -lc "t3 pair --label box-t3-pair"'; }
+
+cmd_ls() {
+  local b state type eur projs hint total=0 many=0
+  local rows
+  rows=$(pool boxes)
+  [ "$BOX_MAX_BOXES" -gt 1 ] || [ "$(wc -l <<< "$rows")" -gt 1 ] && many=1
+  while IFS=$'\t' read -r b state type eur projs; do
+    [ -n "$b" ] || continue
+    if [ "$many" = 0 ]; then on_box "$b" ls_one </dev/null; continue; fi
+    hint=$(box_state_hint "$state" "$b")
+    echo "━━ $b: $state${hint:+ ($hint)}${projs:+ · projects: $projs}"
+    [ "$state" = up ] && on_box "$b" ls_one </dev/null | sed 's/^/  /'
+    total=$(awk "BEGIN { print $total + $eur }")
+    echo
+  done <<< "$rows"
+  [ -n "$rows" ] || on_box "$POOL" ls_one
+  [ "$many" = 0 ] || awk "BEGIN { printf \"Running now: €%.4f/h (≈ €%.2f/month if left on). Pool limit: $BOX_MAX_BOXES box(es).\n\", $total, $total * 730 }"
+}
+
+cmd_close() {
+  parse_args "$@"
+  local b h force="$FORCE" idle=0
+  local -a boxes=() ready=()
+  for b in "${ARGS[@]+"${ARGS[@]}"}"; do
+    case "$b" in
+      --idle) idle=1 ;;
+      *) boxes+=("$b") ;;
+    esac
+  done
+  if [ "$idle" = 1 ]; then
+    while IFS=$'\t' read -r b h; do
+      awk "BEGIN { exit !($h >= $BOX_IDLE_WARN_HOURS) }" && boxes+=("$b")
+    done < <(pool idle)
+  elif [ ${#boxes[@]} -eq 0 ]; then
+    # Every box with a server, running or not: all of them bill. One that is closing already
+    # is left to that close.
+    while IFS=$'\t' read -r b state _; do
+      case "$state" in down|closing) ;; *) boxes+=("$b") ;; esac
+    done < <(pool boxes)
+  fi
+  [ ${#boxes[@]} -gt 0 ] || { echo "Nothing to close."; return; }
+  # Ask about unpushed work one box at a time, then close the rest in parallel.
+  for b in "${boxes[@]}"; do
+    if [ "$force" = 1 ] || { on_box "$b" check_pending && on_box "$b" check_agents; }; then ready+=("$b"); fi
+  done
+  [ ${#ready[@]} -gt 0 ] || return 1
+  sync_all
+  on_boxes "$BOX_REPO/down.sh" "${ready[@]}"
+  [ ${#ready[@]} -eq ${#boxes[@]} ]
+}
+
+# Move a project to another box: stop its sessions, copy its folder, Claude's
+# transcripts and Codex sessions (streamed through this laptop), verify, move
+# the placement, restart the sessions there. The source folder is renamed, not deleted.
+# PROJECT's sessions on BOX into MOVE_SESSIONS (space-separated); fails when the box
+# can't be asked, so a move never copies a folder under agents it didn't stop.
+list_sessions() {  # BOX PROJECT
+  MOVE_SESSIONS=$(on_box "$1" bssh "box --sessions $(printf %q "$2")" | tr '\n' ' ') \
+    || { echo "Couldn't list $2's sessions on $1; nothing was moved." >&2; return 1; }
+  MOVE_SESSIONS=${MOVE_SESSIONS% }
+}
+
+cmd_move() {
+  parse_args "$@"
+  local project from files plan action b path sessions="" sum
+  local -a to_open=()
+  project="${ARGS[0]:-}"
+  [ -n "$project" ] || project=$(pick_project) || exit 1
+  project=$(top_of "$project")
+  [ -n "$TO" ] || { echo "usage: box move PROJECT --to BOX|new" >&2; exit 1; }
+  # Decide: what's on the source (read only if it's up), then the plan.
+  from=$(pool where "$project")
+  files=unknown
+  if [ -n "$from" ] && [ "$(on_box "$from" server_status)" = running ]; then
+    files=$(on_box "$from" bssh "if test -d ~/work/$(printf %q "$project"); then echo yes; else echo no; fi" 2>/dev/null) || files=unreachable
+    [ "$files" = yes ] || [ "$files" = no ] || files=unreachable
+    if [ "$files" = yes ]; then list_sessions "$from" "$project" || exit 1; sessions=$MOVE_SESSIONS; fi
+  fi
+  plan=$(pool move-plan "$project" "$TO" "$files")
+  action=$(plan_get "$plan" action)
+  [ "$TO" != new ] || TO=$(plan_get "$plan" create)
+  read -ra to_open <<< "$(plan_get "$plan" open)"
+  plan_reasons "$plan"
+  [ "$action" != error ] || exit 1
+  # Consent for everything that bills or interrupts, before doing any of it.
+  [ -z "$(plan_get "$plan" create)" ] || bill_gate create "$TO" || exit 1
+  for b in ${to_open[@]+"${to_open[@]}"}; do bill_gate open "$b" || exit 1; done
+  # Ending the project's sessions is asked here too, once, before anything bills: on a closed
+  # source they can't be listed yet, so the consent covers the ones it restores as it opens.
+  if [ "$action" = copy ]; then
+    if [ "$files" = unknown ]; then
+      stop_gate "$from" "$project's sessions there, restored as $from opens" || exit 1
+    else
+      stop_gate "$from" "$sessions" || exit 1
+      # shellcheck disable=SC2046  # one folder per worktree
+      on_box "$from" check_agents "work/$project" $(outside_worktrees_of "$from" "$project") || exit 1
+    fi
+  fi
+  # Execute. Boxes this move opened or created stay up afterwards, which it says on any exit.
+  MOVE_OPENED="$(plan_get "$plan" create) ${to_open[*]}"
+  MOVE_OPENED=$(xargs <<< "$MOVE_OPENED")
+  trap '[ -z "$MOVE_OPENED" ] || echo "This move opened $MOVE_OPENED, which stays up (box close BOX when done)." >&2' EXIT
+  [ -z "$(plan_get "$plan" create)" ] || create_box "$TO" || exit 1
+  open_boxes ${to_open[@]+"${to_open[@]}"} || exit 1
+  # A source that was closed is checked now that it's open: nothing there is a place, not a copy.
+  if [ "$action" = copy ] && [ "$files" = unknown ]; then
+    files=$(on_box "$from" bssh "if test -d ~/work/$(printf %q "$project"); then echo yes; else echo no; fi" 2>/dev/null) || files=unreachable
+    if [ "$files" != yes ]; then
+      plan=$(pool move-plan "$project" "$TO" "$files")
+      action=$(plan_get "$plan" action)
+      plan_reasons "$plan"
+      [ "$action" != error ] || exit 1
+    fi
+  fi
+  path=$(projects list | awk -F'\t' -v p="$project" '$1 == p {print $2}')
+  if [ "$action" = place ]; then
+    pool place "$project" "$TO"
+    clone_repos "$project" "$path" "$TO" || true
+    BOX_NAME="$TO" projects sync "$project" --quiet
+    echo "$project is now on $TO."
+    return
+  fi
+  pool lock
+  trap 'pool unlock; [ -z "$MOVE_OPENED" ] || echo "This move opened $MOVE_OPENED, which stays up (box close BOX when done)." >&2' EXIT
+  on_box "$TO" bssh "test ! -e ~/work/$(printf %q "$project")" \
+    || { echo "work/$project already exists on $TO; move or remove it there first." >&2; exit 1; }
+  local wts w
+  wts=$(outside_worktrees_of "$from" "$project")
+  for w in $wts; do
+    on_box "$TO" bssh "test ! -e ~/$(printf %q "$w")" \
+      || { echo "$w (a worktree of $project) already exists on $TO; move or remove it there first." >&2; exit 1; }
+  done
+  # Listed again right before stopping (the consent above covered the project's sessions:
+  # those a closed source restored, and any started since).
+  list_sessions "$from" "$project" || exit 1
+  sessions=$MOVE_SESSIONS
+  if [ -n "$sessions" ]; then
+    on_box "$from" bssh "for s in $sessions; do tmux kill-session -t \"=\$s\"; done"
+    echo "Stopped $project's sessions on $from: $sessions"
+  fi
+  on_box "$from" bssh "cd ~ && box --files $(printf %q "$project") | tar -cf - -T -" \
+    | on_box "$TO" bssh 'cd ~ && tar -xf -'
+  sum="cd ~/work/$(printf %q "$project") && find . -type f -print0 | sort -z | xargs -0 md5sum | md5sum"
+  if [ "$(on_box "$from" bssh "$sum")" != "$(on_box "$TO" bssh "$sum")" ]; then
+    echo "The copy on $TO differs from $from; nothing was switched over." >&2
+    exit 1
+  fi
+  echo "Copied $project (files, conversations, Codex sessions) from $from to $TO."
+  pool place "$project" "$TO"
+  on_box "$from" bssh "mv ~/work/$(printf %q "$project") ~/work/$(printf %q "$project").moved-to-$TO"
+  for w in $wts; do on_box "$from" bssh "mv ~/$(printf %q "$w") ~/$(printf %q "$w").moved-to-$TO"; done
+  [ -z "$wts" ] || echo "Its worktrees outside the folder came along: $(xargs <<< "$wts")"
+  [ -z "$sessions" ] || on_box "$TO" bssh "for s in $sessions; do $(permission_env)box --start \"\$s\" $(printf %q "$(account_of "$project")"); done"
+  pool unlock
+  trap - EXIT
+  echo "Moved $project to $TO. The old copy on $from is ~/work/$project.moved-to-$TO (delete it when happy)."
+  [ -z "$MOVE_OPENED" ] || echo "This move opened $MOVE_OPENED, which stays up (box close BOX when done)."
+  # shellcheck disable=SC2086  # one argument per session
+  [ -z "$sessions" ] || on_box "$TO" "$BOX_REPO/tabs.sh" $sessions
+}
+
+cmd_add() {
+  parse_args "$@"
+  local path="${ARGS[0]:-}" name b
+  [ -n "$path" ] || { echo "usage: box add PATH [NAME] [--box BOX] [--yes]" >&2; exit 1; }
+  path=$(cd "$path" && pwd)
+  name="${ARGS[1]:-$(basename "$path")}"
+  pool migrate   # projects from before pools get their label first: this one is new, not one of them
+  projects add "$path" "$name"
+  if ! place_project "$name"; then
+    echo "$name is registered, but not on a box and nothing was cloned. Finish it with: box add $path $name --yes (or --box BOX)" >&2
+    exit 1
+  fi
+  b="$PLACED_BOX"
+  clone_repos "$name" "$path" "$b" || true
+  BOX_NAME="$b" projects sync "$name"
+  echo
+  echo "Next: review $path/agentbox.json (data, ports, env_files), run 'box check $name', then 'box attach $name'."
+}
+
+cmd_check() {
+  local t="${1:-.}"
+  [ -d "$t" ] || t=$(projects list | awk -F'\t' -v n="$t" '$1 == n {print $2}')
+  projects check "${t:?unknown project: use a folder or a name from box add}"
+}
+
+# Idle warnings, and (opt-in) closing boxes idle for BOX_AUTO_CLOSE_HOURS; a box
+# with unpushed work is only warned about. Run it from a timer on the laptop, or
+# later from a controller elsewhere; the state it needs lives in Hetzner.
+cmd_tick() {
+  local b h
+  while IFS=$'\t' read -r b h; do
+    if [ -n "$BOX_AUTO_CLOSE_HOURS" ] && awk "BEGIN { exit !($h >= $BOX_AUTO_CLOSE_HOURS) }"; then
+      echo "$b has been idle for ${h}h: closing it (BOX_AUTO_CLOSE_HOURS=$BOX_AUTO_CLOSE_HOURS)."
+      { on_box "$b" check_pending && on_box "$b" check_agents && on_box "$b" "$BOX_REPO/down.sh"; } </dev/null \
+        || echo "⚠  $b wasn't closed (see above)."
+    elif awk "BEGIN { exit !($h >= $BOX_IDLE_WARN_HOURS) }"; then
+      echo "⚠  $b has been idle for ${h}h and is still costing money. Run: box close $b"
+    fi
+  done < <(pool idle)
+}
+
+case "${1:-}" in
+  open) shift; cmd_open "$@"; warn_idle ;;
+  new) shift; cmd_new "$@" ;;
+  attach) shift; cmd_attach "$@" ;;
+  ls | status) if [ "${2:-}" = --json ]; then ls_json; else cmd_ls; warn_idle; fi ;;
+  stop) shift; cmd_stop "$@" ;;
+  resize) shift; cmd_resize "$@" ;;
+  budget) shift; "$BOX_REPO/setup.sh" --budget "$@" ;;
+  prices) "$BOX_REPO/setup.sh" --prices ;;
+  plan) BOX_NAME="${2:-$(pool boxes | awk -F'\t' '$2 == "down" {print $1; exit}')}" "$BOX_REPO/up.sh" --plan ;;
+  close) shift; cmd_close "$@" ;;
+  move) shift; cmd_move "$@" ;;
+  add) shift; cmd_add "$@" ;;
+  login) shift; cmd_login "$@" ;;
+  t3) shift; cmd_t3 "$@" ;;
+  tick) cmd_tick ;;
+  doctor) shift; python3 "$BOX_REPO/onboard.py" doctor "$@" ;;
+  setup) python3 "$BOX_REPO/onboard.py" wizard ;;
+  check) shift; cmd_check "$@" ;;
+  sync) shift; cmd_sync "$@" ;;
+  data) shift; b=$(box_of "${1:?usage: box data NAME PATH ACTION}") || exit 1; BOX_NAME="$b" projects data "$@" ;;
+  session) shift; cmd_session "$@" ;;
+  ssh) shift; cmd_ssh "$@" ;;
+  names) shift; cmd_names "$@" ;;
+  browser) shift; cmd_browser "$@" ;;
+  --browser-tunnel) shift; browser_tunnel "$@" ;;   # what box browser runs in the background
+  help|-h|--help) awk 'NR > 1 && !/^#/ {exit} NR > 1' "$0" | sed 's/^# \{0,1\}//' ;;   # the header comment
+  *) awk 'NR > 1 && !/^#/ {exit} NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

@@ -1,0 +1,14 @@
+# ~/.config/mise/config.toml on the box. Projects pin their own versions with
+# .nvmrc / .node-version / .python-version / .tool-versions / mise.toml.
+[tools]
+node = "lts"
+python = "3.12"
+railway = "latest"   # github:railwayapp/cli release binary
+
+[settings]
+idiomatic_version_file_enable_tools = ["node", "python"]
+trusted_config_paths = ["~/work"]
+yes = true
+
+[settings.node]
+corepack = true

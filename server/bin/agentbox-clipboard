@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""The laptop's clipboard images on the box, so Ctrl+V in a box tab pastes an image.
+
+Installed as `xclip` (first on PATH): Claude Code on Linux reads a pasted image with
+`xclip -selection clipboard -t TARGETS -o` and `... -t image/png -o`. Those reads are answered
+by the laptop: each laptop tab forwards a socket here, /run/agentbox/clip.<session>.<tab>.sock,
+to its clipboard.py (see there for the protocol). Only images: text comes through the terminal.
+Anything else asked of xclip goes to a real xclip if there is one.
+
+  agentbox-clipboard status   which laptop tabs are connected, whether one has an image, and
+                              the last reads (when, from which session, what came back)
+  agentbox-clipboard has-image   exit 0 when a laptop tab has an image (agentbox-tty asks)
+"""
+import hashlib
+import os
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import time
+
+DIR = "/run/agentbox"
+PREFIX = "clip."
+LOG = os.path.join(DIR, "clipboard.log")   # the last reads, no data: whether a Ctrl+V got this far
+LOG_LINES = 20
+
+
+def log(line, path=LOG, keep=LOG_LINES):
+    try:
+        with open(path) as fh:
+            lines = fh.read().splitlines()[-(keep - 1):]
+    except OSError:
+        lines = []
+    lines.append(time.strftime("%H:%M:%S ") + line)
+    try:
+        fd = os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        os.replace(path + ".new", path)
+    except OSError:
+        pass
+
+
+def session_key(session):
+    """The short form of a session name in socket names (tabs.sh asks clipboard.py for the same)."""
+    return hashlib.sha1(session.encode()).hexdigest()[:10]
+
+
+def own_session():
+    """The tmux session this process runs in (the tab where Ctrl+V was pressed shows it)."""
+    pane = os.environ.get("TMUX_PANE")
+    if not pane or not os.environ.get("TMUX"):
+        return None
+    try:
+        r = subprocess.run(["tmux", "display-message", "-p", "-t", pane, "#{session_name}"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.strip() or None
+
+
+def candidates(entries, session):
+    """Socket names to ask, best first: the tabs showing this session, then any other tab
+    (every tab of a laptop reads the same clipboard), newest connection first.
+    entries: (name, mtime) of the files in DIR."""
+    socks = [(n, t) for n, t in entries if n.startswith(PREFIX) and n.endswith(".sock")]
+    mine = PREFIX + session_key(session) + "." if session else None
+    return [n for n, t in sorted(socks, key=lambda e: (not (mine and e[0].startswith(mine)), -e[1]))]
+
+
+def sockets(directory=DIR):
+    out = []
+    try:
+        with os.scandir(directory) as it:
+            for e in it:
+                try:
+                    st = e.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISSOCK(st.st_mode):
+                    out.append((e.name, st.st_mtime))
+    except OSError:
+        pass
+    return out
+
+
+def ask(path, request, timeout):
+    """The laptop's reply to request (bytes after OK), None for NONE; raises OSError when the tab isn't there."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect(path)
+        s.sendall(request.encode() + b"\n")
+        data = b""
+        while True:
+            chunk = s.recv(1 << 16)
+            if not chunk:
+                break
+            data += chunk
+    head, _, body = data.partition(b"\n")
+    if head != b"OK":
+        return None
+    return body
+
+
+def replies(req, timeout, directory=DIR, session=None):
+    """Ask the laptop tabs in turn, yielding each reply (the data, or None for no image). A
+    socket left by a tab that has gone (connection refused) is removed on the way."""
+    for name in candidates(sockets(directory), session):
+        path = os.path.join(directory, name)
+        try:
+            yield ask(path, req, timeout)
+        except (ConnectionRefusedError, FileNotFoundError):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        except OSError:
+            continue
+
+
+def request(req, timeout, directory=DIR, session=None):
+    """The first tab that answers decides (every tab of a laptop has the same clipboard)."""
+    return next(replies(req, timeout, directory, session), None)
+
+
+def parse_xclip(argv):
+    """xclip's options as far as they matter here: (selection, target, output)."""
+    sel, target, out = "primary", None, False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-selection", "-sel", "-se", "-s") and i + 1 < len(argv):
+            sel = argv[i + 1]
+            i += 2
+            continue
+        if a in ("-target", "-t") and i + 1 < len(argv):
+            target = argv[i + 1]
+            i += 2
+            continue
+        if a in ("-o", "-out"):
+            out = True
+        elif a in ("-i", "-in"):
+            out = False
+        i += 1
+    for full in ("primary", "secondary", "clipboard"):
+        if full.startswith(sel):
+            sel = full
+    return sel, target, out
+
+
+def real_xclip():
+    me = os.path.realpath(sys.argv[0])
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        p = shutil.which("xclip", path=d)
+        if p and os.path.realpath(p) != me:
+            return p
+    return None
+
+
+def xclip(argv):
+    sel, target, out = parse_xclip(argv)
+    if not (out and sel == "clipboard"):
+        real = real_xclip()
+        if real:
+            os.execv(real, [real] + argv)
+        print("xclip on agentbox only reads images from your laptop's clipboard.", file=sys.stderr)
+        return 1
+    session = own_session()
+    if target == "TARGETS" or (target or "").startswith("image/"):
+        req = "TARGETS" if target == "TARGETS" else "GET " + target
+        answers = replies(req, 10 if target == "TARGETS" else 30, session=session)
+        data = next(answers, False)
+        log(f"{session or '-'} {req}: " + ("no laptop tab connected" if data is False else
+            "no image in the laptop's clipboard" if data is None else
+            " ".join(data.decode().split()) if target == "TARGETS" else f"{len(data)} bytes"))
+        if not data:
+            return 1
+        sys.stdout.buffer.write(data)
+        return 0
+    log(f"{session or '-'} {target or 'text'}: not served (only images)")
+    return 1   # text: never served (it pastes through the terminal)
+
+
+def status():
+    answers = list(replies("TARGETS", 10))
+    if answers:
+        print(f"Laptop tabs connected: {len(answers)}. Image in the laptop's clipboard: "
+              f"{'yes' if any(answers) else 'no'}.")
+    else:
+        print("No laptop tab is connected: Ctrl+V pastes the laptop's images only in a box tab "
+              "opened from the laptop (0.27.0 or later).")
+    try:
+        with open(LOG) as fh:
+            print("Last reads (Ctrl+V in Claude Code makes two):\n" + fh.read().rstrip())
+    except OSError:
+        print("No reads yet: Ctrl+V hasn't reached Claude Code on this box since it started.")
+    return 0 if answers else 1
+
+
+def main():
+    if os.path.basename(sys.argv[0]) == "xclip":
+        return xclip(sys.argv[1:])
+    if sys.argv[1:] == ["status"]:
+        return status()
+    if sys.argv[1:] == ["has-image"]:   # for agentbox-tty: is a pasted image path on the laptop?
+        data = request("TARGETS", 10)
+        log(f"- pasted image path: {'the laptop has an image' if data else 'no image on the laptop, pasted as text'}")
+        return 0 if data else 1
+    print(__doc__.split("\n\n")[-1], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

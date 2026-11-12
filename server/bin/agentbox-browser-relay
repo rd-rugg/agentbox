@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""The relay between the agents' browser tools and a project's browser (agentbox-browser).
+
+  agentbox-browser-relay NAME PORT
+
+Listens on 127.0.0.1:PORT, the --cdp-endpoint the agents' Playwright MCP servers get. The
+browser starts (agentbox-browser start NAME) on the first request, not on a bare connection.
+Each MCP client gets its own connection to the browser and sees only what it opened: its
+pages (in a window of its own) and their popups, in the browser's default context, so
+sign-ins and cookies are shared while one session never drives another's tabs (or the page
+the user signed in on). Browser.close is refused (the browser is shared), and a client's
+windows close when it disconnects.
+
+Playwright attaches over CDP with flattened sessions: browser-level Target events say which
+pages exist; everything addressed to a session follows from the attach it came with.
+"""
+import asyncio
+import base64
+import hashlib
+import json
+import os
+import struct
+import subprocess
+import sys
+
+MAGIC = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+TOOL = os.environ.get("AGENTBOX_BROWSER", "agentbox-browser")
+
+
+# --- What one client may see -------------------------------------------------------------
+
+class Client:
+    """The bookkeeping for one MCP client: the targets it owns and the sessions it may use.
+    to_browser takes one decoded CDP message from the client and returns (messages for the
+    browser, answers straight back to the client); to_client takes one from the browser and
+    returns (messages for the client, messages the relay sends the browser on its behalf).
+    A message passed on unchanged is the very object given, so the caller can forward the
+    original bytes."""
+
+    HOLD_SECONDS = 2   # how long a page's events wait for this client's createTarget reply
+    REFUSED = {        # browser-wide commands that would break the shared browser for everyone
+        "Browser.close", "Browser.crash", "Browser.crashGpuProcess", "Storage.clearCookies",
+        "Target.attachToBrowserTarget", "Target.exposeDevToolsProtocol",
+    }
+    BY_TARGET = {"Target.attachToTarget", "Target.closeTarget", "Target.activateTarget",
+                 "Target.getTargetInfo", "Browser.getWindowForTarget"}
+
+    def __init__(self, clock=None):
+        import time
+        self.clock = clock or time.monotonic
+        self.owned = set()       # targetIds: pages this client created, and their popups
+        self.sessions = {}       # sessionId it may use -> the targetId it belongs to
+        self.contexts = set()    # browser contexts it created itself
+        self.creates = {}        # request id -> method, for createTarget/createBrowserContext in flight
+        self.closed_ids = set()  # request ids the relay sent itself (answers dropped)
+        self.held = []           # (time, event) page events waiting for a createTarget reply
+        self.own_id = 10 ** 9
+
+    def next_id(self):
+        self.own_id += 1
+        self.closed_ids.add(self.own_id)
+        return self.own_id
+
+    @staticmethod
+    def refuse(msg, why):
+        sys.stderr.write(f"relay: refused {msg.get('method')} ({why})\n")
+        return [], [{"id": msg.get("id"), **({"sessionId": msg["sessionId"]} if "sessionId" in msg else {}),
+                     "error": {"code": -32000, "message": f"agentbox: {why}"}}]
+
+    def to_browser(self, msg):
+        method, sid, params = msg.get("method"), msg.get("sessionId"), msg.get("params") or {}
+        if sid is not None:
+            if sid not in self.sessions:
+                return self.refuse(msg, "not a session of this agent")
+            return [msg], []
+        if method in self.REFUSED:
+            if method == "Browser.close":
+                return [], [{"id": msg.get("id"), "result": {}}]   # the browser is shared: leave it open
+            return self.refuse(msg, f"{method} isn't allowed: this browser is shared with other sessions")
+        # (Without a targetId, getTargetInfo and getWindowForTarget mean the browser itself.)
+        if method in self.BY_TARGET and "targetId" in params and params["targetId"] not in self.owned:
+            return self.refuse(msg, "not a page of this agent")
+        if method == "Target.detachFromTarget" and params.get("sessionId") not in self.sessions:
+            return self.refuse(msg, "not a session of this agent")
+        if method == "Target.disposeBrowserContext" and params.get("browserContextId") not in self.contexts:
+            return self.refuse(msg, "not a browser context of this agent")
+        if method == "Target.createTarget":
+            if not params.get("newWindow"):
+                msg = {**msg, "params": {**params, "newWindow": True}}   # a window of its own, same context
+            self.creates[msg.get("id")] = method
+        elif method == "Target.createBrowserContext":
+            self.creates[msg.get("id")] = method
+        return [msg], []
+
+    def _visible(self, info):
+        info = info or {}
+        return (info.get("targetId") in self.owned or info.get("openerId") in self.owned
+                or info.get("type") == "browser")
+
+    def _own(self, info):
+        """A page it opened, or a popup of one (not the browser target itself)."""
+        info = info or {}
+        if info.get("type") != "browser" and (info.get("targetId") in self.owned or info.get("openerId") in self.owned):
+            self.owned.add(info.get("targetId"))
+
+    def to_client(self, msg):
+        out, back = self._to_client(msg)
+        return out, back + self.expire_held()
+
+    def _to_client(self, msg):
+        if "id" in msg:
+            if msg["id"] in self.closed_ids:
+                self.closed_ids.discard(msg["id"])
+                return [], []
+            method = self.creates.pop(msg["id"], None)
+            result = msg.get("result")
+            if method == "Target.createBrowserContext" and isinstance(result, dict):
+                self.contexts.add(result.get("browserContextId"))
+            if method == "Target.createTarget":
+                if isinstance(result, dict) and result.get("targetId"):
+                    self.owned.add(result["targetId"])
+                out, back = [], []
+                held, self.held = self.held, []
+                for _, ev in held:   # events of this page that came first: still before the reply,
+                    o, b = self._to_client(ev)   # as Chromium sends them (Playwright expects the page known)
+                    out += o
+                    back += b
+                return out + [msg], back
+            if isinstance(result, dict) and isinstance(result.get("targetInfos"), list):   # Target.getTargets
+                msg = {**msg, "result": {**result, "targetInfos": [t for t in result["targetInfos"] if self._visible(t)]}}
+            return [msg], []
+        sid, method, params = msg.get("sessionId"), msg.get("method", ""), msg.get("params") or {}
+        if sid is not None:
+            # Inside an attachment of this client (its page, or a worker or frame of it).
+            if sid not in self.sessions:
+                return [], []
+            if method == "Target.attachedToTarget":
+                self.sessions[params.get("sessionId")] = (params.get("targetInfo") or {}).get("targetId")
+            elif method == "Target.detachedFromTarget":
+                self.sessions.pop(params.get("sessionId"), None)
+            return [msg], []
+        info = params.get("targetInfo") or {"targetId": params.get("targetId")}
+        if method == "Target.attachedToTarget":
+            self._own(info)
+            if self._visible(info):
+                self.sessions[params.get("sessionId")] = info.get("targetId")
+                return [msg], []
+            if self._hold(msg, info):
+                return [], []
+            return [], self._let_go(params)
+        if method in ("Target.targetCreated", "Target.targetInfoChanged", "Target.targetDestroyed", "Target.targetCrashed"):
+            if method == "Target.targetCreated":
+                self._own(info)
+            if self._visible(info):
+                if method == "Target.targetDestroyed":
+                    t = info.get("targetId")
+                    self.owned.discard(t)
+                    for s_, t_ in list(self.sessions.items()):
+                        if t_ == t:
+                            del self.sessions[s_]
+                return [msg], []
+            self._hold(msg, info)
+            return [], []
+        if method == "Target.detachedFromTarget":
+            if params.get("sessionId") in self.sessions:
+                del self.sessions[params["sessionId"]]
+                return [msg], []
+            return [], []
+        return [msg], []
+
+    def _hold(self, msg, info):
+        """Keep an event of a page that may be the one this client is creating."""
+        if any(m == "Target.createTarget" for m in self.creates.values()) and info.get("type") in ("page", None):
+            self.held.append((self.clock(), msg))
+            return True
+        return False
+
+    def _let_go(self, params):
+        """Someone else's target this connection was auto-attached to: resume it if it waits
+        for the debugger (or that page would hang), and detach."""
+        sid = params.get("sessionId")
+        back = []
+        if params.get("waitingForDebugger"):
+            back.append({"id": self.next_id(), "method": "Runtime.runIfWaitingForDebugger", "sessionId": sid})
+        back.append({"id": self.next_id(), "method": "Target.detachFromTarget", "params": {"sessionId": sid}})
+        return back
+
+    def expire_held(self, force=False):
+        """Held events whose createTarget reply didn't come in time: someone else's after all."""
+        now, back, keep = self.clock(), [], []
+        for t, ev in self.held:
+            if force or now - t >= self.HOLD_SECONDS:
+                if ev.get("method") == "Target.attachedToTarget":
+                    back += self._let_go(ev.get("params") or {})
+            else:
+                keep.append((t, ev))
+        self.held = keep
+        return back
+
+    def closing(self):
+        """The client went away: close its pages (their windows go with them)."""
+        return [{"id": self.next_id(), "method": "Target.closeTarget", "params": {"targetId": t}}
+                for t in sorted(self.owned)]
+
+
+# --- WebSocket framing (RFC 6455, the parts CDP uses) ---------------------------------------
+
+def xor(data, mask):
+    """Apply a 4-byte WebSocket mask (one big-integer XOR, not a byte loop)."""
+    if not data:
+        return data
+    n = len(data)
+    key = (mask * (n // 4 + 1))[:n]
+    return (int.from_bytes(data, "big") ^ int.from_bytes(key, "big")).to_bytes(n, "big")
+
+
+async def read_frame(reader):
+    """One frame: (opcode, fin, payload)."""
+    b1, b2 = await reader.readexactly(2)
+    n = b2 & 0x7F
+    if n == 126:
+        n = struct.unpack(">H", await reader.readexactly(2))[0]
+    elif n == 127:
+        n = struct.unpack(">Q", await reader.readexactly(8))[0]
+    mask = await reader.readexactly(4) if b2 & 0x80 else None
+    data = await reader.readexactly(n)
+    return b1 & 0x0F, bool(b1 & 0x80), xor(data, mask) if mask else data
+
+
+class Messages:
+    """Whole messages from a WebSocket: fragments joined, control frames (ping, pong, close)
+    returned as they come without losing a message they interrupt."""
+
+    def __init__(self, reader):
+        self.reader, self.parts, self.first = reader, [], None
+
+    async def next(self):
+        while True:
+            op, fin, data = await read_frame(self.reader)
+            if op in (0x8, 0x9, 0xA):
+                return op, data
+            if self.first is None:
+                self.first = op
+            self.parts.append(data)
+            if fin:
+                op, data = self.first, b"".join(self.parts)
+                self.parts, self.first = [], None
+                return op, data
+
+
+async def read_message(reader):
+    return await Messages(reader).next()
+
+
+def frame(op, data, masked):
+    head = bytes([0x80 | op])
+    n = len(data)
+    bit = 0x80 if masked else 0
+    if n < 126:
+        head += bytes([bit | n])
+    elif n < 65536:
+        head += bytes([bit | 126]) + struct.pack(">H", n)
+    else:
+        head += bytes([bit | 127]) + struct.pack(">Q", n)
+    if masked:
+        key = os.urandom(4)
+        return head + key + xor(data, key)
+    return head + data
+
+
+async def read_head(reader):
+    head = await reader.readuntil(b"\r\n\r\n")
+    lines = head.decode("latin-1").split("\r\n")
+    headers = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    return lines[0], headers, head
+
+
+async def read_response(r, wait=10):
+    """An HTTP answer from Chromium, read by its length (it keeps the connection open):
+    (status line, headers, head, body)."""
+    status, headers, head = await asyncio.wait_for(read_head(r), wait)
+    n = int(headers.get("content-length", "0") or 0)
+    body = await asyncio.wait_for(r.readexactly(n), wait) if n else b""
+    return status, headers, head, body
+
+
+async def ws_connect(port, path, wait=10):
+    """A WebSocket to the browser on 127.0.0.1:PORT: (reader, writer) after its 101."""
+    r, w = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", port), wait)
+    try:
+        key = base64.b64encode(os.urandom(16)).decode()
+        w.write((f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n"
+                 f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        await w.drain()
+        status, _, _ = await asyncio.wait_for(read_head(r), wait)
+        if " 101 " not in status + " ":
+            raise OSError(f"the browser refused the WebSocket: {status}")
+    except BaseException:   # a timeout too: no connection to the browser is left behind
+        w.close()
+        raise
+    return r, w
+
+
+# --- The relay --------------------------------------------------------------------------------
+
+class Relay:
+    def __init__(self, name, port):
+        self.name, self.port = name, port
+        self.lock = asyncio.Lock()
+
+    async def browser_port(self):
+        async with self.lock:
+            p = await asyncio.create_subprocess_exec(TOOL, "start", self.name,
+                                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = await p.communicate()
+            sys.stderr.write(err.decode(errors="replace"))
+            ports = [l[4:] for l in out.decode().splitlines() if l.startswith("cdp=")]
+            return int(ports[0]) if p.returncode == 0 and ports and ports[0].isdigit() else None
+
+    async def serve(self, r, w):
+        try:
+            first_line, headers, raw = await read_head(r)
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError):
+            w.close()   # the readiness check (connect and close) starts nothing
+            return
+        try:
+            target = await self.browser_port()
+            if target is None:
+                raise OSError("the browser didn't start")
+            if headers.get("upgrade", "").lower() == "websocket":
+                await self.websocket(r, w, first_line, headers, target)
+            else:
+                await self.http(r, w, raw, target)
+        except Exception as e:   # the agent's browser tools get a closed connection, not a hang
+            sys.stderr.write(f"relay: {type(e).__name__}: {e}\n")
+        finally:
+            w.close()
+
+    async def http(self, r, w, raw, target):
+        """/json/version and friends: Chromium's answer, with its WebSocket addresses pointing
+        here instead of straight at the browser."""
+        tr, tw = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", target), 10)
+        try:
+            tw.write(raw)
+            await tw.drain()
+            status, headers, head, body = await read_response(tr)
+        finally:
+            tw.close()
+        head = head[:-4]
+        body = body.replace(f"127.0.0.1:{target}".encode(), f"127.0.0.1:{self.port}".encode())
+        body = body.replace(f"localhost:{target}".encode(), f"127.0.0.1:{self.port}".encode())
+        lines = [l for l in head.split(b"\r\n") if not l.lower().startswith(b"content-length:")]
+        w.write(b"\r\n".join(lines) + f"\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body)
+        await w.drain()
+
+    async def websocket(self, r, w, first_line, headers, target):
+        path = first_line.split(" ")[1]
+        # The browser end first: a client is only accepted once there's somewhere to send to.
+        br, bw = await ws_connect(target, path)
+        accept = base64.b64encode(hashlib.sha1(headers["sec-websocket-key"].encode() + MAGIC).digest()).decode()
+        w.write((f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                 f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode())
+        await w.drain()
+        client = Client()
+        lock = asyncio.Lock()
+
+        async def send_browser(msgs):
+            for m in msgs:
+                bw.write(frame(0x1, json.dumps(m).encode(), masked=True))
+            await bw.drain()
+
+        async def send_client(msgs):
+            for m in msgs:
+                w.write(frame(0x1, json.dumps(m).encode(), masked=False))
+            await w.drain()
+
+        async def from_client():
+            msgs = Messages(r)
+            while True:
+                op, data = await msgs.next()
+                if op == 0x8:
+                    return
+                if op == 0x9:
+                    w.write(frame(0xA, data, masked=False))
+                    continue
+                if op not in (0x1, 0x2):
+                    continue
+                msg = json.loads(data)
+                async with lock:
+                    to_b, back = client.to_browser(msg)
+                    if len(to_b) == 1 and to_b[0] is msg:   # unchanged: forward its own bytes
+                        bw.write(frame(op, data, masked=True))
+                        await bw.drain()
+                    else:
+                        await send_browser(to_b)
+                    await send_client(back)
+
+        async def from_browser():
+            msgs = Messages(br)
+            while True:
+                op, data = await msgs.next()
+                if op == 0x8:
+                    return
+                if op == 0x9:
+                    bw.write(frame(0xA, data, masked=True))
+                    continue
+                if op not in (0x1, 0x2):
+                    continue
+                msg = json.loads(data)
+                async with lock:
+                    to_c, back = client.to_client(msg)
+                    await send_browser(back)
+                    if len(to_c) == 1 and to_c[0] is msg:
+                        w.write(frame(op, data, masked=False))
+                        await w.drain()
+                    else:
+                        await send_client(to_c)
+
+        async def hold_timer():
+            while True:   # a page held for a createTarget reply never waits long
+                await asyncio.sleep(0.5)
+                if client.held:
+                    async with lock:
+                        await send_browser(client.expire_held())
+
+        tasks = [asyncio.ensure_future(c) for c in (from_client(), from_browser(), hold_timer())]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in tasks:
+                t.cancel()
+            try:   # the session ended: close its windows
+                await asyncio.wait_for(send_browser(client.closing()), 5)
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+            bw.close()
+
+
+async def main(name, port):
+    relay = Relay(name, port)
+    server = await asyncio.start_server(relay.serve, "127.0.0.1", port, limit=2 ** 20)
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    asyncio.run(main(sys.argv[1], int(sys.argv[2])))

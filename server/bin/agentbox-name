@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""A box session's name for messages: its short name BOX/SESSION (agentbox-2/acme+blog),
+which the owner can type and other sessions message by, followed by the session's own title
+when it has one: "agentbox-2/acme+blog · Blog publishing".
+
+Claude Code gives a session one name: what /rename and --name set, what the peer list
+(ListAgents) shows on this and other machines, and what SendMessage resolves (an exact name
+delivers; a short name that starts a longer one gets back "re-send with the ref", one step).
+A new conversation gets the short name from --name at its start (box's launch_claude). A
+resumed one keeps its own name: --name would replace the owner's title, and neither
+--remote-control NAME nor a SessionStart hook's sessionTitle renames it on other machines
+(Claude Code 2.1.316). Only a /rename in the session does, and no hook fires on one. So
+agentbox keeps the name the one way that works: tmux runs `agentbox-name keep SESSION PANE`
+when an agent pane's title changes without the short name in it (Claude Code sets the title
+at start and on every rename, from the terminal or from claude.ai; tmux.conf's filter), and
+this types `/rename SHORT · TITLE` into the session, keeping its title. It types only into
+the session's own agent (not a `claude` started in another window), when Claude Code says
+it's idle, its input line is empty, and nobody has pressed a key in it for a few seconds,
+then checks the rename took, at most twice per change. Off unless BOX_REMOTE_CONTROL=1;
+Codex sessions have no such name.
+
+This file also reads Claude Code's per-process session files (~/.claude/sessions/*.json:
+not a documented format, read defensively) for `box --peers`, so there is one reader.
+
+  agentbox-name keep SESSION PANE   keep the session's name (tmux's pane-title-changed hook)
+  agentbox-name keep-all            the same for every session's agent now, in the background
+                                    (sessions started before names were kept)
+  agentbox-name peers               per session: SESSION, agent, name, remote|local|none|codex
+  agentbox-name tmux-options        the tmux options tmux.conf's hook and tab titles read
+  agentbox-name combine SHORT NAME  the name to keep, given the name in effect
+  agentbox-name short SESSION       this box's short name for SESSION
+"""
+import fcntl
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+CONF = os.path.expanduser("~/.config/agentbox")
+SESSIONS = os.path.expanduser("~/.claude/sessions")
+SEP = " · "
+# Session names: acme, acme+blog, acme/sub, acme@codex (tmux allows
+# neither ":" nor "." in them).
+SESSION_PART = r"[^\s·:.]+"
+TRIES = int(os.environ.get("AGENTBOX_NAME_TRIES", "40"))      # looks, about 10 minutes
+PAUSE = float(os.environ.get("AGENTBOX_NAME_PAUSE", "15"))     # seconds between looks
+SETTLE = float(os.environ.get("AGENTBOX_NAME_SETTLE", "3"))    # for Claude Code to take a rename
+QUIET = float(os.environ.get("AGENTBOX_NAME_QUIET", "5"))      # seconds without a key pressed
+RENAMES = 2                                                     # /renames typed per change, at most
+# Name sources Claude Code uses for names nobody chose (the folder's name): replaced by the
+# short name alone. Any other source (a /rename, --name, a title from claude.ai) is a title.
+GENERATED = {"derived", "auto", "generated", "default"}
+ESC_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)")
+
+
+def pool_of(box):
+    return re.sub(r"-\d+$", "", box)
+
+
+def is_short(text, short):
+    """True if TEXT is a short name of this pool: BOX/SESSION with BOX this box or another of
+    its pool (agentbox, agentbox-2, ...: a session moved from one keeps its old one in front).
+    A title like "frontend/api" isn't one."""
+    pool = pool_of(short.split("/", 1)[0])
+    return re.fullmatch(rf"{re.escape(pool)}(-\d+)?/{SESSION_PART}", text) is not None
+
+
+def combine(short, title):
+    """The name to keep: SHORT, then the session's own title (what the owner named it) without
+    any short name in front, or SHORT alone when it has none."""
+    title = (title or "").strip()
+    head, sep, rest = title.partition(SEP)
+    if sep and is_short(head, short):
+        title = rest.strip()
+    elif is_short(title, short):
+        title = ""
+    return f"{short}{SEP}{title}" if title else short
+
+
+def prompt_empty(screen):
+    """True if the pane (captured with -e, colours kept) shows Claude Code's input line with
+    nothing typed in it and no work running below it. The input line is the last one starting
+    with "❯"; Claude Code's grey suggestion ("Try ...") is drawn dim and counts as empty, while
+    a draft or a dialog's "❯ Yes" choice don't. Only the lines from the input line down (its
+    status bar) are checked for "esc to interrupt", not the conversation above."""
+    lines = screen.splitlines()
+    at = max((i for i, line in enumerate(lines) if ESC_RE.sub("", line).lstrip().startswith("❯")), default=None)
+    if at is None:
+        return False
+    if any("esc to interrupt" in ESC_RE.sub("", line) for line in lines[at:]):
+        return False
+    rest = lines[at][lines[at].index("❯") + 1:]
+    rest = re.sub(r"\x1b\[2m.*?(\x1b\[(0|22)m|$)", "", rest)   # the dim suggestion
+    return ESC_RE.sub("", rest).replace("\xa0", " ").strip() == ""
+
+
+def saved(key):
+    try:
+        with open(os.path.join(CONF, "permissions")) as fh:
+            values = [line.split("=", 1)[1].strip() for line in fh if line.startswith(key + "=")]
+        return values[-1] if values else ""
+    except OSError:
+        return ""
+
+
+def box_name():
+    try:
+        with open(os.path.join(CONF, "box-name")) as fh:
+            name = fh.read().strip()
+            if name:
+                return name
+    except OSError:
+        pass
+    return os.uname().nodename.split(".")[0]
+
+
+def short(session):
+    return f"{box_name()}/{session}"
+
+
+def running_sessions(sessions_dir=None):
+    """{(tmux session, pane id): session file} for Claude processes still running, from Claude
+    Code's per-process files (their "tmux" field: SESSION:@WINDOW.%PANE)."""
+    found = {}
+    for path in glob.glob(os.path.join(sessions_dir or SESSIONS, "*.json")):
+        try:
+            with open(path) as fh:
+                d = json.load(fh)
+            os.kill(int(d["pid"]), 0)          # a file left by a process that has ended
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        where = str(d.get("tmux") or "")
+        if ":" in where and "." in where:
+            found[(where.split(":", 1)[0], where.rsplit(".", 1)[1])] = d
+    return found
+
+
+def in_pane(session, pane, sessions_dir=None):
+    """The Claude process in SESSION's PANE as {name, title, idle, remote}: TITLE is its name
+    unless Claude Code generated it. None if no running Claude is there (yet)."""
+    d = running_sessions(sessions_dir).get((session, pane))
+    if d is None:
+        return None
+    name = str(d.get("name") or "")
+    return {"name": name, "title": "" if d.get("nameSource") in GENERATED else name,
+            "idle": d.get("status") in (None, "idle"), "remote": bool(d.get("bridgeSessionId"))}
+
+
+def tmux(*args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True)
+
+
+def agent_panes():
+    """{tmux session: its agent pane}: the pane box started the agent in (box --run-agent),
+    else the session's first pane. A `claude` typed in another window isn't the session's."""
+    out = tmux("list-panes", "-a", "-F", "#{session_name}\t#{pane_id}\t#{m:*--run-agent*,#{pane_start_command}}").stdout
+    panes = {}
+    for line in out.splitlines():
+        session, pane, agent = (line.split("\t") + ["", ""])[:3]
+        if session and (session not in panes or (agent == "1" and panes[session][1] != "1")):
+            panes[session] = (pane, agent)
+    return {s: p for s, (p, _) in panes.items()}
+
+
+def quiet(session):
+    """True if no client attached to SESSION has pressed a key for QUIET seconds."""
+    out = tmux("list-clients", "-t", session, "-F", "#{client_activity}").stdout.split()
+    return all(time.time() - int(t) >= QUIET for t in out if t.isdigit())
+
+
+def rename(pane, name):
+    """Type /rename NAME and Enter in one tmux command, so nothing typed meanwhile lands in
+    between."""
+    tmux("send-keys", "-t", pane, "-l", f"/rename {name}", ";", "send-keys", "-t", pane, "Enter")
+
+
+def keep(session, pane):
+    if saved("BOX_REMOTE_CONTROL") != "1" or session.endswith("@codex"):
+        return 0
+    if agent_panes().get(session) != pane:
+        return 0
+    want_short = short(session)
+    # One look at a time per pane. A change while one runs leaves a mark, and the running
+    # one looks again before it ends, so no change is missed.
+    os.makedirs(os.path.join(CONF, "locks"), exist_ok=True)
+    base = os.path.join(CONF, "locks", f"name-{pane.lstrip('%')}")
+    again = base + ".again"
+    lock = open(base, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        open(again, "w").close()
+        return 0
+    while True:
+        try:
+            os.remove(again)
+        except OSError:
+            pass
+        look(session, pane, want_short)
+        if not os.path.exists(again):
+            return 0
+
+
+def look(session, pane, want_short):
+    missing = typed = 0
+    for i in range(TRIES):
+        if tmux("display-message", "-p", "-t", pane, "#{pane_id}").returncode != 0:
+            return                            # the pane is gone
+        found = in_pane(session, pane)
+        if found is None:
+            missing += 1
+            if missing > 4:                   # no Claude in this pane: a shell, ended
+                return
+        else:
+            want = combine(want_short, found["title"])
+            if found["name"] == want or typed >= RENAMES:
+                return                        # right, or Claude Code keeps it its own way
+            if (found["idle"] and quiet(session)
+                    and prompt_empty(tmux("capture-pane", "-e", "-p", "-t", pane).stdout)):
+                rename(pane, want)
+                typed += 1
+                time.sleep(SETTLE)
+                continue
+        # Quick looks first (a session is busy for a moment after a rename), then slower.
+        time.sleep(min(PAUSE, 2) if i < 5 else PAUSE)
+
+
+def keep_all():
+    """Run keep for each session's agent pane, each in the background so a busy session
+    doesn't hold up the others. Prints the sessions."""
+    if saved("BOX_REMOTE_CONTROL") != "1":
+        print("Messaging is off on this box (BOX_REMOTE_CONTROL), so its sessions keep their names.")
+        return 0
+    for session, pane in sorted(agent_panes().items()):
+        if session.endswith("@codex"):
+            continue
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "keep", session, pane],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        print(f"{session}: {short(session)}, added when the session is idle with nothing typed")
+    return 0
+
+
+def peers():
+    """Per running session: SESSION, agent, the name it answers to ("-" for none), and
+    remote (reachable from other machines), local, none (no Claude found) or codex."""
+    found = running_sessions()
+    for session, pane in sorted(agent_panes().items()):
+        if session.endswith("@codex"):
+            print(f"{session}\tcodex\t-\tcodex")
+            continue
+        d = found.get((session, pane))
+        if d is None:
+            print(f"{session}\tclaude\t-\tnone")
+        else:
+            state = "remote" if d.get("bridgeSessionId") else "local"
+            print(f"{session}\tclaude\t{str(d.get('name') or '-')}\t{state}")
+    return 0
+
+
+def tmux_options():
+    """The options tmux.conf reads: @agentbox-names (1 with messaging on), @agentbox-box and
+    @agentbox-pool (this box's name and its pool's, for the tab titles), as tmux commands."""
+    box = box_name()
+    print(f"set -g @agentbox-names {'1' if saved('BOX_REMOTE_CONTROL') == '1' else '0'}")
+    print(f"set -g @agentbox-box {box}")
+    print(f"set -g @agentbox-pool {pool_of(box)}")
+    return 0
+
+
+def main(argv):
+    if len(argv) == 3 and argv[0] == "keep":
+        return keep(argv[1], argv[2])
+    if argv == ["keep-all"]:
+        return keep_all()
+    if argv == ["peers"]:
+        return peers()
+    if argv == ["tmux-options"]:
+        return tmux_options()
+    if len(argv) == 3 and argv[0] == "combine":
+        print(combine(argv[1], argv[2]))
+        return 0
+    if len(argv) == 2 and argv[0] == "short":
+        print(short(argv[1]))
+        return 0
+    sys.stderr.write(__doc__.split("\n\n")[-1])
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

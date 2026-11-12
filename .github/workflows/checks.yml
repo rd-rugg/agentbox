@@ -1,0 +1,190 @@
+# The checks and the secret and dependency scans (formerly security.yml), in one job, on pull
+# requests only: a push runs nothing until it has a pull request. The weekly scheduled run is the
+# dependency report alone, and a newer push to a pull request cancels the run before it.
+name: checks
+on:
+  pull_request:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # What to run. The weekly scheduled run is only the scans below. A pull request that changes
+      # only documentation (DOCS_PATTERN) skips the checks but still gets the scans; no check is
+      # required on this plan, so a skipped one blocks nothing.
+      - name: What this change touches
+        id: changes
+        env:
+          DOCS_PATTERN: '^[^/]+\.md$'
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            echo "The weekly run: only the scans."
+            exit 0
+          fi
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            # The merge commit's first parent is the base branch as it is now.
+            git rev-parse -q --verify HEAD^1 >/dev/null || git fetch -q --no-tags --depth=2 origin "$GITHUB_SHA"
+            changed=$(git diff --name-only HEAD^1 HEAD)
+            if ! grep -qvE "$DOCS_PATTERN" <<<"$changed"; then
+              echo "::notice::Only documentation changed: the checks are skipped."
+              exit 0
+            fi
+          fi
+          echo "code=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        if: steps.changes.outputs.code == 'true'
+        with:
+          python-version: "3.12"
+      - name: shellcheck
+        if: steps.changes.outputs.code == 'true'
+        run: |
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -x -S warning box lib.sh setup.sh up.sh down.sh status.sh tabs.sh install-local.sh \
+            server/install.sh server/bin/box server/bin/agentbox-browser server/bin/git-credential-box server/bin/with-cli-token \
+            server/git-hooks/passthrough server/shell.sh scripts/publish.sh
+      - name: python compiles
+        if: steps.changes.outputs.code == 'true'
+        run: python3 -m py_compile onboard.py projects.py sessions.py readiness.py pool.py server_types.py env_to_bitwarden.py server/secrets server/git-hooks/pre-commit server/bin/agentbox-browser-relay scripts/publish_gates.py
+      - name: offline tests
+        if: steps.changes.outputs.code == 'true'
+        run: python3 -m unittest discover -s tests
+      - name: plugin manifest
+        if: steps.changes.outputs.code == 'true'
+        run: |
+          npm install -g @anthropic-ai/claude-code >/dev/null
+          claude plugin validate .
+
+      # Secrets and known-vulnerable dependencies, here rather than in a workflow of their own so
+      # they share this job's runner. gitleaks reads only the pull
+      # request's commits, never the older history; made-up credentials in test fixtures are
+      # allowlisted by path in .gitleaks.toml, when this repository has one. OSV-Scanner reads
+      # every lockfile and fails a pull request only on vulnerabilities it adds (the base and the
+      # head are scanned and compared). The weekly scheduled run (and a manual one) lists every
+      # known vulnerability in the job summary without failing. A tree without lockfiles (the
+      # public repository's) skips the dependency scans: the scanner fails on nothing to read. These steps come last because they check out the base and the head; they need the
+      # full history (`fetch-depth: 0` on the checkout) and run even when a check above failed.
+      - name: Secrets in the new commits (gitleaks)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          curl -fsSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          # A base that was force-pushed away is missing here: then the commits the head brings
+          # over its first parent are read.
+          if [ -n "$BASE" ] && git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            range="${BASE}..${HEAD}"
+          elif git cat-file -e "${HEAD}~1^{commit}" 2>/dev/null; then
+            range="${HEAD}~1..${HEAD}"
+          else
+            range="-1 ${HEAD}"
+          fi
+          echo "Reading commits: ${range}"
+          /tmp/gitleaks git --log-opts="${range}" --redact --no-banner --verbose .
+
+      - name: Lockfiles to scan
+        id: deps
+        if: ${{ !cancelled() }}
+        run: |
+          if git ls-files | grep -qE '(^|/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|uv\.lock|poetry\.lock|Pipfile\.lock|requirements[^/]*\.txt|Cargo\.lock|go\.sum|Gemfile\.lock|composer\.lock)$'; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No lockfiles in this tree: the dependency scans are skipped."
+          fi
+
+      - name: Dependencies on the base (OSV-Scanner)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.deps.outputs.any == 'true' }}
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        # Without the build output and installed trees above, so both scans see only the
+        # lockfiles in Git.
+        run: |
+          git clean -ffdqx || echo "::warning::git clean left files behind; the scans may read them."
+          git checkout -q -f "$BASE"
+      - if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.deps.outputs.any == 'true' }}
+        uses: google/osv-scanner-action/osv-scanner-action@0a65f82af05cd58cf587827b0bb0489548c18346 # v2.7.0
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --format=json
+            --output=osv-old.json
+            --recursive
+            ./
+
+      - name: Dependencies on this change (OSV-Scanner)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.deps.outputs.any == 'true' }}
+        env:
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: git checkout -q -f "$HEAD"
+      - if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.deps.outputs.any == 'true' }}
+        uses: google/osv-scanner-action/osv-scanner-action@0a65f82af05cd58cf587827b0bb0489548c18346 # v2.7.0
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --format=json
+            --output=osv-new.json
+            --recursive
+            ./
+
+      # The scanner exits non-zero both on findings and on a failed scan; a failed scan writes no
+      # results, and the comparison below would read a missing file as "nothing new". The results
+      # are written inside the checkout because the scanner runs in a container that sees only it.
+      - name: Both scans completed
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.deps.outputs.any == 'true' }}
+        run: |
+          for f in osv-old.json osv-new.json; do
+            if [ ! -s "$f" ]; then
+              echo "::error::OSV-Scanner wrote no results to $f; see the scan step above."
+              exit 1
+            fi
+          done
+
+      - name: Vulnerabilities this change adds
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.deps.outputs.any == 'true' }}
+        uses: google/osv-scanner-action/osv-reporter-action@0a65f82af05cd58cf587827b0bb0489548c18346 # v2.7.0
+        with:
+          scan-args: |-
+            --old=osv-old.json
+            --new=osv-new.json
+            --gh-annotations=true
+            --fail-on-vuln=true
+
+      - name: Every known vulnerability (weekly report)
+        if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.any == 'true' }}
+        uses: google/osv-scanner-action/osv-scanner-action@0a65f82af05cd58cf587827b0bb0489548c18346 # v2.7.0
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --format=markdown
+            --output=osv-report.md
+            --recursive
+            ./
+      - name: Report to the job summary
+        if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.deps.outputs.any == 'true' }}
+        run: |
+          if [ -s osv-report.md ]; then
+            cat osv-report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::OSV-Scanner wrote no report; see the step above."
+            exit 1
+          fi
+    timeout-minutes: 20

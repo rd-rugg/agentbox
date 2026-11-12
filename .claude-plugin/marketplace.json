@@ -1,0 +1,15 @@
+{
+  "name": "agentbox",
+  "description": "agentbox: a pay-when-used server for coding agents on Hetzner Cloud.",
+  "owner": {
+    "name": "rd-rugg",
+    "url": "https://github.com/rd-rugg"
+  },
+  "plugins": [
+    {
+      "name": "agentbox",
+      "description": "Run coding agents (Claude Code, Codex) on a Hetzner Cloud server you can snapshot and delete when idle, and bring back with every session intact.",
+      "source": "./"
+    }
+  ]
+}

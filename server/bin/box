@@ -1,0 +1,532 @@
+#!/bin/bash
+# `box` on the box: agent sessions (Claude Code or Codex) and helpers.
+# One tmux session per project and agent, and the agent *is* the session:
+# quitting it ends the session, closing a terminal tab only detaches. NAME runs
+# Claude, NAME@codex runs Codex, both in ~/work/NAME, side by side.
+#   box                     pick a running session (or start "main" in ~/work)
+#   box NAME | attach NAME  attach to NAME, starting its agent in ~/work/NAME if needed
+#   box clone OWNER/REPO [NAME]  clone into ~/work/NAME and install the tool versions it pins
+#   box doctor              tool versions, secrets, GitHub and Tailscale status
+#   box browser [NAME] [--stop]  start (or stop) the project's browser and print a link to it
+#                           for the user (Ctrl+click in a box tab): they sign in to a site there
+#                           before you use it. NAME defaults to the project of this folder
+# Used by the laptop's `box` command:
+#   box --start NAME [ACCOUNT]  start NAME in the background; with ACCOUNT, Claude uses
+#                           the token CLI__CLAUDE_TOKEN_<ACCOUNT> from Bitwarden
+#   box --permissions       save BOX_CLAUDE_PERMISSIONS / BOX_CODEX_PERMISSIONS / BOX_REMOTE_CONTROL
+#                           from the environment (--start does too) for the sessions started from now on
+#   box --peers             each session: NAME, agent, the name it answers to for messages, and
+#                           remote (Remote Control connected) | local (this box only) | none | codex
+#   box --ls                projects in ~/work: name, running|done, last activity, path, agents
+#   box --idle              seconds since the last agent activity on the box
+#   box --agents            agents outside these tmux sessions, one JSON line each (agentbox-agents)
+#   box --load              one JSON line: free memory and idle seconds (for placement and idle checks)
+#   box --sessions PROJECT  the project's sessions (NAME, NAME@codex, NAME/...)
+#   box --files PROJECT     paths (relative to ~) that belong to a project: its folder, Claude
+#                           transcripts, Codex sessions; used to move it to another box
+#   box --git-status [--fetch]  checkouts in ~/work with work that isn't on GitHub (agentbox-git)
+#   box --save | --restore  record running sessions (before close) / start them again (after open)
+#   box --claude-login      "yes" if Claude has a real login here (not just MCP sign-ins), else "no"
+#   box --tab-closed NAME   the laptop closed NAME's tab: box open won't reopen it (box attach does)
+#   box --tab-sessions      sessions box open opens a tab for; then "background<TAB>NAME" per closed tab
+set -euo pipefail
+# Also called over plain `ssh agentbox box ...`, which doesn't load ~/.profile.
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+
+WORK="$HOME/work"
+STATE="$HOME/.box-sessions"
+PERMS="$HOME/.config/agentbox/permissions"   # the laptop's session settings (box.conf), see save_permissions
+BOX_NAME_FILE="$HOME/.config/agentbox/box-name"   # this box's name in the pool (install.sh)
+CLOSED_TABS="$HOME/.config/agentbox/closed-tabs"   # sessions whose tab the user closed
+MCP_PORT_FILE="$HOME/.config/agentbox/mcp-callback-port"   # forwarded by every laptop tab
+[ -f "$STATE" ] || [ ! -f "$HOME/.cs-sessions" ] || mv "$HOME/.cs-sessions" "$STATE"   # older name
+
+# NAME@codex -> project NAME, agent codex; plain NAME -> claude. NAME+LABEL is
+# another session in the same project folder (e.g. resuming another conversation).
+project_of() { local p="${1%@*}"; echo "${p%%+*}"; }
+agent_of() { case "$1" in *@codex) echo codex ;; *) echo claude ;; esac; }
+# NAME/SUB is the subfolder SUB, or else the worktree SUB (NAME/.claude/worktrees/SUB).
+dir_of() {
+  local p wt; p=$(project_of "$1")
+  [ "$p" = main ] && { echo "$WORK"; return; }
+  wt="$WORK/${p%%/*}/.claude/worktrees/${p#*/}"
+  if [[ "$p" == */* ]] && [ ! -d "$WORK/$p" ] && [ -d "$wt" ]; then echo "$wt"; else echo "$WORK/$p"; fi
+}
+
+# Claude's transcript folder for a project dir (every non-alphanumeric char becomes -).
+transcripts_of() { echo "$HOME/.claude/projects/$(sed 's|[^A-Za-z0-9]|-|g' <<< "$1")"; }
+# Worktrees of project $1's repos that sit outside its folder but under ~ (T3 Code keeps its
+# own in ~/.t3/worktrees), relative to ~: a move carries them with the project.
+outside_worktrees() {
+  local p="$1" g w
+  find "$WORK/$p" -maxdepth 3 -name .git -type d -not -path '*/node_modules/*' 2>/dev/null | while read -r g; do
+    git -C "${g%/.git}" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p'
+  done | while read -r w; do
+    case "$w/" in "$WORK/$p/"*) ;; "$HOME/"*) echo "${w#"$HOME"/}" ;; esac
+  done | sort -u
+}
+
+# The session settings in the environment (from the laptop's box.conf), saved for the
+# sessions started from now on: the permission modes (an unknown one falls back to auto)
+# and BOX_REMOTE_CONTROL (1: sessions message other machines, see messaging_flags).
+# A setting the environment lacks keeps its saved value (a laptop on an older box
+# command doesn't send BOX_REMOTE_CONTROL).
+save_permissions() {
+  [ -n "${BOX_CLAUDE_PERMISSIONS:-}${BOX_CODEX_PERMISSIONS:-}${BOX_REMOTE_CONTROL:-}" ] || return 0
+  local claude="${BOX_CLAUDE_PERMISSIONS:-$(saved BOX_CLAUDE_PERMISSIONS)}" codex="${BOX_CODEX_PERMISSIONS:-$(saved BOX_CODEX_PERMISSIONS)}"
+  local remote="${BOX_REMOTE_CONTROL:-$(saved BOX_REMOTE_CONTROL)}"
+  claude="${claude:-auto}" codex="${codex:-auto}"
+  case "${remote:-0}" in 0 | 1) remote="${remote:-0}" ;;
+    *) echo "BOX_REMOTE_CONTROL=$remote isn't 0 or 1; using 0" >&2; remote=0 ;;
+  esac
+  case "$claude" in default) claude=manual ;; bypassPermissions) claude=bypass ;; esac   # Claude's config names
+  case "$claude" in auto | bypass | manual | acceptEdits | plan | dontAsk) ;;
+    *) echo "BOX_CLAUDE_PERMISSIONS=$claude isn't a mode (auto, bypass, manual, acceptEdits, plan, dontAsk); using auto" >&2
+       claude=auto ;;
+  esac
+  case "$codex" in auto | bypass | manual) ;;
+    *) echo "BOX_CODEX_PERMISSIONS=$codex isn't a mode (auto, bypass, manual); using auto" >&2
+       codex=auto ;;
+  esac
+  mkdir -p "$(dirname "$PERMS")"   # written whole, then renamed: a session starting meanwhile reads old or new
+  printf 'BOX_CLAUDE_PERMISSIONS=%s\nBOX_CODEX_PERMISSIONS=%s\nBOX_REMOTE_CONTROL=%s\n' "$claude" "$codex" "$remote" > "$PERMS.$$"
+  mv "$PERMS.$$" "$PERMS"
+}
+
+# A saved session setting (save_permissions), or nothing.
+saved() { sed -n "s/^$1=//p" "$PERMS" 2>/dev/null | tail -1; }
+
+# The agent's command-line flags for its saved permission mode, one per line.
+permission_flags() {  # claude|codex
+  local mode
+  mode=$(saved "BOX_${1^^}_PERMISSIONS")
+  case "$1:${mode:-auto}" in
+    claude:bypass) echo --dangerously-skip-permissions ;;
+    claude:manual | claude:acceptEdits | claude:plan | claude:dontAsk) printf '%s\n' --permission-mode "$mode" ;;
+    claude:*) printf '%s\n' --permission-mode auto ;;
+    codex:bypass) echo --dangerously-bypass-approvals-and-sandbox ;;
+    codex:manual) ;;   # whatever ~/.codex/config.toml says
+    codex:*) echo --approve-for-me ;;
+  esac
+}
+
+# This box's name in the pool (agentbox, agentbox-2, ...): box.conf's BOX_NAME as install.sh
+# saved it, else the hostname (Hetzner names the server's host after it).
+box_name() { cat "$BOX_NAME_FILE" 2>/dev/null || hostname -s; }
+
+# A session's short name: BOX/SESSION (agentbox-2/acme+blog). A new conversation connects
+# to Remote Control under it; after that the session's name is "SHORT · its title", kept by
+# agentbox-name from tmux's pane-title-changed hook (a /rename or a resume would otherwise
+# drop the short name: see agentbox-name). A move to another box changes the BOX part.
+peer_name() { echo "$(box_name)/$1"; }
+
+# agentbox-name next to this script (the repo's server/bin in tests), else on PATH.
+name_tool() {
+  local here; here="$(dirname "$(readlink -f "$0")")"
+  if [ -x "$here/agentbox-name" ]; then echo "$here/agentbox-name"; else echo agentbox-name; fi
+}
+
+# Claude's flags for messages between sessions, one per line, for session $1. With
+# BOX_REMOTE_CONTROL=1 the session connects to Remote Control under its peer name, which
+# makes it reachable from the user's sessions on other machines (and them from it), and
+# it takes their messages: a session that bypasses permission prompts would otherwise hold
+# every message from a prompting one for an approval nobody sees in its tmux pane. A
+# message is never the user's consent and runs no commands (Claude Code's own rules); the
+# session's permission mode still applies to what it does about one. --settings sits
+# above the user settings synced from the laptop, which stay as they are.
+messaging_flags() {  # SESSION
+  [ "$(saved BOX_REMOTE_CONTROL)" = 1 ] && [ -n "$1" ] || return 0
+  printf '%s\n' --remote-control "$(peer_name "$1")" --settings '{"crossSessionInbound":"accept"}'
+}
+
+# True if Claude has its own login on this box. ~/.claude/.credentials.json also
+# holds MCP servers' sign-ins, so the file existing doesn't mean Claude is signed in.
+claude_logged_in() {
+  python3 - "$HOME/.claude/.credentials.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    sys.exit(0 if (json.load(open(sys.argv[1])).get("claudeAiOauth") or {}).get("accessToken") else 1)
+except (OSError, ValueError):
+    sys.exit(1)
+PY
+}
+
+# Run the agent as the session's program, resuming this folder's last
+# conversation. If it dies within seconds (not logged in, crashed), keep the
+# pane open so the error can be read.
+run_agent() {
+  local agent="$1" started=$SECONDS token flags messaging session
+  mapfile -t flags < <(permission_flags "$agent")
+  # The tmux session's name: CB_SESSION from start, else (older sessions) this pane's own
+  # session. Outside a pane there's none, and no messaging: tmux would answer with the most
+  # recently used session, and two processes would register under one name.
+  session="${CB_SESSION:-}"
+  if [ -z "$session" ] && [ -n "${TMUX_PANE:-}" ]; then
+    session=$(tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null || true)
+  fi
+  # MCP sign-ins call back on the port every tab forwards (Codex reads it from config.toml).
+  if [ -s "$MCP_PORT_FILE" ]; then export MCP_OAUTH_CALLBACK_PORT; MCP_OAUTH_CALLBACK_PORT=$(cat "$MCP_PORT_FILE"); fi
+  if [ "$agent" = codex ]; then
+    if [ -n "${CB_CONVERSATION:-}" ]; then codex "${flags[@]}" || true
+    else codex resume --last "${flags[@]}" || codex "${flags[@]}" || true; fi
+    if (( SECONDS - started < 5 )); then
+      echo; read -rp "Codex exited right away (logged in? run 'box login codex' on your laptop). Press Enter to close. "
+    fi
+    return
+  fi
+  # Boxes in a pool can't share one login (its tokens rotate), so a box without
+  # its own login uses the long-lived token CLI__CLAUDE_TOKEN_DEFAULT if it exists.
+  if [ -z "${CB_ACCOUNT:-}" ] && ! claude_logged_in \
+      && token=$(secrets --get cli CLAUDE_TOKEN_DEFAULT 2>/dev/null); then
+    export CLAUDE_CODE_OAUTH_TOKEN="$token"
+  fi
+  if [ -n "${CB_ACCOUNT:-}" ]; then
+    if token=$(secrets --get cli "CLAUDE_TOKEN_$(tr '[:lower:]-' '[:upper:]_' <<< "$CB_ACCOUNT")"); then
+      export CLAUDE_CODE_OAUTH_TOKEN="$token"
+    else
+      echo "No CLI__CLAUDE_TOKEN_* secret for account $CB_ACCOUNT; using this box's login."
+    fi
+  fi
+  if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && ! claude_logged_in; then
+    echo "Claude isn't signed in on this box. Type /login below, open the link on your laptop and"
+    echo "paste the code back here. To sign in new boxes automatically, run \`claude setup-token\` on"
+    echo "your laptop and store the token in Bitwarden as CLI__CLAUDE_TOKEN_DEFAULT."
+    echo
+  fi
+  mapfile -t messaging < <(messaging_flags "$session")
+  if [ ${#messaging[@]} -gt 0 ]; then export AGENTBOX_PEER_NAME="${messaging[1]}"; fi   # for the agent itself
+  local rc=0
+  launch_claude "${flags[@]}" ${messaging[@]+"${messaging[@]}"} || rc=$?
+  # A start that fails right away with the messaging flags is tried once without them
+  # (Remote Control needs a claude.ai sign-in, which a setup-token may not be): the
+  # session then runs, reachable from this box only, and says why.
+  if (( SECONDS - started < 5 )) && [ "$rc" -ne 0 ] && [ ${#messaging[@]} -gt 0 ]; then
+    echo "Claude exited right away with Remote Control on; starting it without, so only sessions on"
+    echo "this box can message it (Remote Control needs a claude.ai sign-in: /login here)."
+    messaging=() started=$SECONDS rc=0
+    unset AGENTBOX_PEER_NAME
+    launch_claude "${flags[@]}" || rc=$?
+  fi
+  # Claude normally starts in manual mode when auto mode isn't available; if it
+  # fails right away instead, try once more in manual mode.
+  if (( SECONDS - started < 5 )) && [ "$rc" -ne 0 ] && [ "${flags[*]}" = "--permission-mode auto" ]; then
+    echo "Claude exited right away in auto mode; starting it again in manual mode."
+    echo "(Set BOX_CLAUDE_PERMISSIONS=manual in box.conf if auto mode isn't available to you.)"
+    started=$SECONDS
+    launch_claude --permission-mode default ${messaging[@]+"${messaging[@]}"} || true
+  fi
+  if (( SECONDS - started < 5 )); then
+    echo; read -rp "Claude exited right away. Press Enter to close this session. "
+  fi
+}
+
+# Start Claude in this session's conversation with the given flags (run_agent passes the
+# permission mode and the messaging flags every time, so a resumed conversation keeps both);
+# returns Claude's exit status. A session tied to one conversation keeps it: resumed once it exists,
+# else started with that id (box new, or `claude` typed in a plain shell).
+# With messaging on (AGENTBOX_PEER_NAME), a new conversation is named by its short name: the
+# --remote-control name reaches only other machines, and Claude Code would name it after the
+# folder here. A resumed one keeps its name (the owner's title; agentbox-name adds the short
+# name in front), since --name would replace that title.
+launch_claude() {
+  local -a named=()
+  [ -z "${AGENTBOX_PEER_NAME:-}" ] || named=(--name "$AGENTBOX_PEER_NAME")
+  if [ -n "${CB_CONVERSATION:-}" ]; then
+    if [ -n "$(find "$HOME/.claude/projects" -maxdepth 2 -name "$CB_CONVERSATION.jsonl" -print -quit 2>/dev/null)" ]; then
+      claude --resume "$CB_CONVERSATION" "$@"
+    else
+      claude --session-id "$CB_CONVERSATION" ${named[@]+"${named[@]}"} "$@"
+    fi
+  else
+    claude --continue "$@" || claude ${named[@]+"${named[@]}"} "$@"
+  fi
+}
+
+# Forget that NAME's tab was closed (it has a tab again, or it ended).
+tab_reopened() {
+  [ -f "$CLOSED_TABS" ] || return 0
+  grep -vxF -- "$1" "$CLOSED_TABS" > "$CLOSED_TABS.$$" || true
+  mv "$CLOSED_TABS.$$" "$CLOSED_TABS"
+}
+
+# True if an agent (claude or codex) runs anywhere under process $1 (a pane's shell).
+has_agent() {
+  ps -eo pid=,ppid=,comm= | awk -v root="$1" '
+    { parent[$1] = $2; name[$1] = $3 }
+    END {
+      for (p in name) {
+        if (name[p] != "claude" && name[p] != "codex") continue
+        for (q = p; q != "" && q != 1 && q != 0; q = parent[q]) if (q == root) exit 0
+      }
+      exit 1
+    }'
+}
+
+start() {  # name [account] [conversation] [folder]; the folder follows from the name unless given
+  local name="$1" dir="${4:-}" account="${2:-}" conversation="${3:-}"
+  [ -n "$dir" ] || dir=$(dir_of "$name")
+  tmux has-session -t "=$name" 2>/dev/null && return 0
+  mkdir -p "$dir"
+  # A login shell gives the agent the same PATH as an interactive terminal.
+  tmux new-session -d -s "$name" -c "$dir" -e "CB_SESSION=$name" -e "CB_ACCOUNT=$account" \
+    -e "CB_CONVERSATION=$conversation" -e "CB_DIR=${4:-}" \
+    "bash -lc 'box --run-agent $(agent_of "$name")'"
+}
+
+case "${1:-}" in
+  --run-agent) run_agent "${2:-claude}" ;;
+  --run-claude) run_agent claude ;;   # sessions started by older versions (as `cs`)
+  --start) save_permissions; start "${2:?usage: box --start NAME [ACCOUNT] [CONVERSATION]}" "${3:-}" "${4:-}" ;;
+  --permissions) save_permissions ;;
+  --here)   # `claude [-c | -r ID]` typed in a plain shell (see shell.sh): run it in a tmux session
+    shift   # for this folder instead, so a dropped connection doesn't end it
+    here=$(pwd -P)
+    case "$here/" in "$WORK"/*) p="${here#"$WORK"/}"; p="${p%%/*}" ;; *) p=main ;; esac
+    conversation=""
+    case "${1:-}" in
+      "") conversation=$(cat /proc/sys/kernel/random/uuid) ;;
+      -c | --continue)
+        conversation=$(ls -t "$(transcripts_of "$here")"/*.jsonl 2>/dev/null | head -1 | xargs -r basename -s .jsonl) ;;
+      -r | --resume) [[ "${2:-}" =~ ^[0-9a-f-]{8,}$ ]] && conversation=$(find "$HOME/.claude/projects" -maxdepth 2 \
+          -name "$2*.jsonl" -printf '%f\n' | head -1 | sed 's/\.jsonl$//') ;;
+    esac
+    if [ -z "$conversation" ] || [ $# -gt 2 ]; then   # anything else (-p, a picker, more flags): as asked
+      exec claude "$@"
+    fi
+    name="$p+${conversation:0:8}"
+    start "$name" "" "$conversation" "$here"
+    echo "Claude runs in tmux session $name, so a dropped connection doesn't end it (Ctrl+b d detaches)."
+    exec tmux attach -t "=$name"
+    ;;
+  --attach)   # what a laptop tab runs: attach, but never start (a session that ended stays ended)
+    tab_reopened "${2:?usage: box --attach NAME}"
+    tmux has-session -t "=$2" 2>/dev/null \
+      || { echo "Session $2 has ended. Start it again from the laptop: box attach ${2%%+*}"; exit 0; }
+    # agentbox-tty: the laptop terminal's paste of a clipboard image (an empty paste, or a copied
+    # file's path) reaches the session as Ctrl+V, the key Claude Code pastes images with.
+    exec agentbox-tty tmux attach -t "=$2" \; refresh-client   # one full redraw for the (re)connected terminal
+    ;;
+  --tab-closed)   # the user closed NAME's tab (or detached): box open leaves it in the background
+    mkdir -p "$(dirname "$CLOSED_TABS")"
+    tab_reopened "${2:?usage: box --tab-closed NAME}"
+    tmux has-session -t "=$2" 2>/dev/null && echo "$2" >> "$CLOSED_TABS"
+    ;;
+  --peers)   # "messaging<TAB>0|1" (BOX_REMOTE_CONTROL), then per running session:
+    # SESSION<TAB>agent<TAB>name it answers to<TAB>remote|local|none|codex ("-" for no name),
+    # read by agentbox-name from Claude Code's per-process session files (one reader for both).
+    printf 'messaging\t%s\n' "$(saved BOX_REMOTE_CONTROL | grep -x 1 || echo 0)"
+    "$(name_tool)" peers 2>/dev/null || true
+    ;;
+  --tab-sessions)   # running sessions to open tabs for; then "background<TAB>NAME" for closed tabs
+    running=$(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+    closed=$(cat "$CLOSED_TABS" 2>/dev/null || true)
+    grep -vxF -f <(printf '%s\n' "$closed") <<< "$running" | grep . || true
+    grep -xF -f <(printf '%s\n' "$closed") <<< "$running" | grep . | sed 's/^/background\t/' || true
+    ;;
+  --claude-login) if claude_logged_in; then echo yes; else echo no; fi ;;
+  --conversation)   # full id of the conversation whose id starts with $3, in project $2's folders
+    find "$HOME/.claude/projects" -maxdepth 2 -name "${3:?usage: box --conversation PROJECT ID}*.jsonl" \
+      -path "*$(sed 's|[^A-Za-z0-9]|-|g' <<< "$WORK/${2:?}")*" -printf '%f\n' | sed 's/\.jsonl$//'
+    ;;
+  --sessions)
+    p="${2:?usage: box --sessions PROJECT}"
+    tmux list-sessions -F '#{session_name}' 2>/dev/null | while read -r s; do
+      [ "$(project_of "$s")" = "$p" ] || [[ "$s" == "$p/"* ]] && echo "$s"
+    done || true
+    ;;
+  --files)
+    p="${2:?usage: box --files PROJECT}"
+    cd ~
+    echo "work/$p"
+    # Transcripts of the project folder and its subfolders, found from the real
+    # folders (a name prefix would also match other projects, e.g. foo-bar).
+    find "work/$p" -maxdepth 3 -type d -not -path '*/.git*' -not -path '*/node_modules*' 2>/dev/null \
+      | while read -r d; do t=$(transcripts_of "$HOME/$d"); if [ -d "$t" ]; then echo "${t#"$HOME"/}"; fi; done
+    grep -rlsE "\"cwd\":\"$WORK/$p(\"|/)" .codex/sessions 2>/dev/null || true
+    outside_worktrees "$p" | while read -r w; do
+      echo "$w"
+      t=$(transcripts_of "$HOME/$w"); if [ -d "$t" ]; then echo "${t#"$HOME"/}"; fi
+      grep -rlsE "\"cwd\":\"$HOME/$w(\"|/)" .codex/sessions 2>/dev/null || true
+    done
+    ;;
+  --worktrees)   # project $2's worktrees outside its folder (box move carries them)
+    outside_worktrees "${2:?usage: box --worktrees PROJECT}"
+    ;;
+  --save)
+    # Only sessions where the agent is still running; quit ones are done.
+    : > "$STATE.tmp"
+    # Name, account and the conversation it resumes (if one was chosen); the folder
+    # follows from the name (tmux's own session_path goes stale on renames).
+    while IFS=$'\t' read -r name pid; do
+      grep -q "^$name	" "$STATE.tmp" && continue
+      account=$(tmux show-environment -t "=$name" CB_ACCOUNT 2>/dev/null | sed -n 's/^CB_ACCOUNT=//p' || true)
+      conversation=$(tmux show-environment -t "=$name" CB_CONVERSATION 2>/dev/null | sed -n 's/^CB_CONVERSATION=//p' || true)
+      dir=$(tmux show-environment -t "=$name" CB_DIR 2>/dev/null | sed -n 's/^CB_DIR=//p' || true)
+      has_agent "$pid" && printf '%s\t%s\tc:%s\td:%s\n' "$name" "$account" "$conversation" "$dir" >> "$STATE.tmp"
+    done < <(tmux list-panes -a -F '#{session_name}	#{pane_pid}' 2>/dev/null || true)
+    mv "$STATE.tmp" "$STATE"
+    # Close the project browsers cleanly, so a kept (--persist) profile is written out.
+    agentbox-browser stop --all >/dev/null 2>&1 || true
+    echo "Saved sessions: $(cut -f1 "$STATE" | paste -sd' ' -)"
+    ;;
+  --restore)
+    [ -s "$STATE" ] || { echo "No saved sessions."; exit 0; }
+    started=()
+    while IFS=$'\t' read -r -a f; do
+      name="${f[0]:-}"
+      [ -n "$name" ] || continue
+      tmux has-session -t "=$name" 2>/dev/null && continue
+      # Lines are "name<TAB>account<TAB>c:conversation<TAB>d:folder"; older ones
+      # lack c:/d:, and the oldest had a folder (/home/...) before the account.
+      conversation="" dir=""
+      while [ ${#f[@]} -gt 1 ] && [[ "${f[${#f[@]}-1]}" == [cd]:* ]]; do
+        case "${f[${#f[@]}-1]}" in c:*) conversation="${f[${#f[@]}-1]#c:}" ;; d:*) dir="${f[${#f[@]}-1]#d:}" ;; esac
+        unset 'f[${#f[@]}-1]'
+      done
+      account="${f[${#f[@]}-1]}"
+      [ ${#f[@]} -gt 1 ] && [[ "$account" != /* ]] || account=""
+      start "$name" "$account" "$conversation" "$dir"
+      started+=("$name")
+    done < "$STATE"
+    echo "Restoring sessions: ${started[*]:-none}"
+    ;;
+  --ls)
+    running=$(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+    # Newest Codex session file per working directory (Codex records its cwd in line 1).
+    codex_last=$(find "$HOME/.codex/sessions" -name '*.jsonl' -printf '%T@\t%p\n' 2>/dev/null \
+      | sort -rn | head -300 | python3 -c '
+import json, sys
+seen = {}
+for line in sys.stdin:
+    ts, path = line.rstrip("\n").split("\t", 1)
+    try:
+        cwd = json.loads(open(path).readline()).get("payload", {}).get("cwd")
+    except (OSError, ValueError):
+        continue
+    if cwd and cwd not in seen:
+        seen[cwd] = ts
+for cwd, ts in seen.items():
+    print(f"{cwd}\t{ts}")' || true)
+    for dir in "$WORK" "$WORK"/*/; do
+      dir=${dir%/}
+      [ -d "$dir" ] || continue
+      name=$([ "$dir" = "$WORK" ] && echo main || basename "$dir")
+      t=$(transcripts_of "$dir")
+      last=$( { find "$t" -maxdepth 1 -name '*.jsonl' -printf '%T@\n' 2>/dev/null
+                awk -F'\t' -v d="$dir" '$1 == d {print $2}' <<< "$codex_last"; } | sort -n | tail -1 || true)
+      agents=$(grep -E "^${name}(@codex)?\$" <<< "$running" | while read -r s; do agent_of "$s"; done | paste -sd, - || true)
+      # main (~/work itself) only counts as a project once an agent has been used there.
+      [ "$name" = main ] && [ -z "$last" ] && [ -z "$agents" ] && continue
+      status=$([ -n "$agents" ] && echo running || echo "done")
+      printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$status" "${last%.*}" "$dir" "$agents"
+    done
+    ;;
+  --git-status)
+    # Work that exists only on this box (uncommitted changes, commits no remote branch
+    # holds, stashes) in every checkout and worktree under ~/work. --fetch first updates
+    # the remote branches (box close does; box ls doesn't, to stay quick).
+    agentbox-git status "$WORK" ${2:+"$2"}
+    ;;
+  --load)   # one JSON line: memory, swap, load, stalls, biggest memory users, idle seconds
+    python3 - "$("$0" --idle)" "$(tmux list-sessions 2>/dev/null | wc -l)" <<'PY'
+import json, os, subprocess, sys
+mem = {l.split(":")[0]: int(l.split()[1]) // 1024 for l in open("/proc/meminfo")}
+def stall(kind):   # % of the last 60 s that all tasks waited for memory / some waited for CPU
+    try:
+        rows = dict(l.split(" ", 1) for l in open(f"/proc/pressure/{kind}").read().splitlines())
+        return float(dict(kv.split("=") for kv in rows["full" if kind == "memory" else "some"].split())["avg60"])
+    except (OSError, KeyError, ValueError):
+        return None
+top = subprocess.run(["ps", "-eo", "rss=,comm=", "--sort=-rss"], capture_output=True, text=True).stdout.splitlines()[:5]
+print(json.dumps({
+    "mem_total_mb": mem["MemTotal"], "mem_avail_mb": mem["MemAvailable"],
+    "swap_total_mb": mem.get("SwapTotal", 0), "swap_used_mb": mem.get("SwapTotal", 0) - mem.get("SwapFree", 0),
+    "load1": round(os.getloadavg()[0], 2), "cpus": os.cpu_count(),
+    "mem_stall_pct": stall("memory"), "cpu_stall_pct": stall("cpu"),
+    "top": [[int(r.split()[0]) // 1024, r.split(None, 1)[1]] for r in top if len(r.split()) > 1],
+    "sessions": int(sys.argv[2] or 0),
+    "idle_s": int(sys.argv[1] or 0)}))
+PY
+    ;;
+  --agents)   # agents another program started (T3 Code, a script): box ls shows them, close checks them
+    exec agentbox-agents
+    ;;
+  --idle)
+    last=$(find "$HOME/.claude/projects" "$HOME/.codex/sessions" -name '*.jsonl' -printf '%T@\n' 2>/dev/null | sort -n | tail -1 || true)
+    act=$(tmux list-sessions -F '#{session_activity}' 2>/dev/null | sort -n | tail -1 || true)   # no tmux server: none
+    newest=$(printf '%s\n%s\n' "${last%.*}" "$act" | sort -n | tail -1)
+    echo $(( $(date +%s) - ${newest:-$(date +%s)} ))
+    ;;
+  "")
+    if tmux list-sessions >/dev/null 2>&1; then
+      exec tmux attach \; choose-tree -s -Z
+    fi
+    start main
+    exec tmux attach -t "=main"
+    ;;
+  clone)
+    repo="${2:?usage: box clone OWNER/REPO [NAME]}"
+    name="${3:-$(basename "$repo" .git)}"
+    dir="$HOME/work/$name"
+    if [ -d "$dir/.git" ]; then
+      echo "$dir already exists." >&2
+    else
+      git clone "https://github.com/${repo#https://github.com/}" "$dir"
+    fi
+    # Install the Node/Python versions the project pins (.nvmrc, .python-version, mise.toml, ...).
+    (cd "$dir" && mise install --yes >/dev/null 2>&1) || true
+    echo "$name"
+    ;;
+  doctor)
+    for tool in git gh mise node npm pnpm python3 uv railway docker tailscale claude codex; do
+      printf '%-10s %s\n' "$tool" "$(command -v "$tool" >/dev/null && "$tool" --version 2>/dev/null | head -1 || echo '-')"
+    done
+    printf '%-10s %s\n' secrets "$(secrets --apps 2>&1 | paste -sd' ' -)"
+    printf '%-10s %s\n' github "$(git ls-remote https://github.com/cli/cli HEAD >/dev/null 2>&1 && echo 'git over https OK' || echo 'no access')"
+    command -v codex >/dev/null && printf '%-10s %s\n' codex-login "$(codex login status 2>&1 | head -1)"
+    printf '%-10s %s\n' tailnet "$(tailscale status --self --peers=false 2>/dev/null | head -1 || echo 'not connected')"
+    if command -v Xvnc >/dev/null && [ -d /usr/share/novnc ] && command -v agentbox-browser >/dev/null; then
+      printf '%-10s %s\n' browser "viewer ready; running: $(agentbox-browser status | cut -f1 | paste -sd' ' -)"
+    else
+      printf '%-10s %s\n' browser "no viewer (BOX_PLAYWRIGHT=1 on the laptop, then up.sh)"
+    fi
+    ;;
+  browser)   # the project's browser; the user sees and uses it from the laptop
+    shift
+    name="" stop=0
+    for a in "$@"; do case "$a" in --stop) stop=1 ;; -*) ;; *) name="$a" ;; esac; done
+    if [ -z "$name" ]; then
+      case "$PWD/" in "$WORK"/*/*) name="${PWD#"$WORK"/}"; name="${name%%/*}" ;; esac
+    fi
+    [ -n "$name" ] || { echo "usage: box browser NAME [--stop] (or run it in a project folder)" >&2; exit 1; }
+    if [ "$stop" = 1 ]; then agentbox-browser stop "$name"; echo "Stopped the browser for $name."; exit 0; fi
+    out=$(agentbox-browser start "$name")
+    link=""
+    if grep -q '^router=' <<< "$out"; then link=$(agentbox-browser link "$name" 2>/dev/null || true); fi
+    if [ -n "$link" ]; then
+      echo "The browser for $name is running on this box. Open it with this link (Ctrl+click it in"
+      echo "the box tab; it works for 15 minutes, then box browser gives a new one):"
+      echo "  $link"
+      echo "If the link doesn't open, reopen this tab (tabs opened before agentbox 0.24.0 don't"
+      echo "forward its port), or run this on the laptop instead: box browser $name"
+    else
+      echo "The browser for $name is running on this box. Ask the user to run this on their laptop:"
+      echo "  box browser $name"
+    fi
+    echo "Signing in there is enough: the agents' browser tools work in that same browser."
+    if [ -n "$(sed -n 's/^proxy=//p' <<< "$out")" ]; then
+      echo "Its traffic goes out through the user's laptop (they chose --via-laptop): pages load"
+      echo "only while their box browser tunnel runs; otherwise they show a proxy error."
+    fi
+    ;;
+  -h | --help | help) awk 'NR > 1 && !/^#/ {exit} NR > 1' "$0" | sed 's/^# \{0,1\}//' ;;   # the header comment
+  -*) echo "unknown option $1 (see box --help)" >&2; exit 1 ;;
+  attach | new)
+    start "${2:?usage: box attach NAME}"
+    exec tmux attach -t "=$2"
+    ;;
+  *)
+    start "$1"
+    exec tmux attach -t "=$1"
+    ;;
+esac

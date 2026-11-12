@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Give a version to each mise tool whose shim would otherwise fail outside the projects that pin it.
+
+mise's shims are global (one `jq` on PATH for every folder), but versions are per folder: a
+project's mise.toml that pins jq makes mise install it and create the shim, and in every other
+folder that shim fails with "No version is set for shim: jq", unless the system has its own jq
+(then the shim runs that one, which is mise's own fallback and stays as it is). So a tool gets a
+default only when it has no global version and none of its commands exists outside mise: its
+newest installed version, in its own conf.d file, rewritten on every sync (it follows installs
+and removals). A project's own pin still wins inside that project, and a command the system has
+is never shadowed.
+
+    agentbox-mise-defaults          write ~/.config/mise/conf.d/00-agentbox-defaults.toml, say what changed
+    agentbox-mise-defaults --check  print what it would write, change nothing
+"""
+import json
+import os
+import subprocess
+import sys
+
+# "00-": projects' tool files are conf.d/agentbox-NAME.toml (projects.py), so no project name can
+# collide with this one.
+CONF = os.path.expanduser("~/.config/mise/conf.d/00-agentbox-defaults.toml")
+MISE = os.path.expanduser("~/.local/bin/mise")
+# mise's own folders: its shims, and its installs (mise puts the active tools' folders on PATH for
+# whatever it runs, this script included, since python3 here is a mise tool).
+MISE_DATA = os.environ.get("MISE_DATA_DIR") or os.path.expanduser("~/.local/share/mise")
+
+
+def defaults(listing, needs_default, own_path=CONF):
+    """{tool: version} to write. LISTING is `mise ls --json` run where no project config applies,
+    so an active entry means a global config sets the tool (an entry set only by this file,
+    OWN_PATH, doesn't count: it's recomputed). mise lists each tool's versions oldest first: the
+    last installed one is the newest. NEEDS_DEFAULT(tool, version) says whether its shims would
+    fail without one (no command of it exists outside mise)."""
+    out = {}
+    for tool, versions in listing.items():
+        if any(v.get("active") and (v.get("source") or {}).get("path") != own_path for v in versions):
+            continue
+        installed = [v["version"] for v in versions if v.get("installed") and v.get("version")]
+        if installed and needs_default(tool, installed[-1]):
+            out[tool] = installed[-1]
+    return out
+
+
+def outside_mise(command, path_dirs, data=None):
+    """Whether COMMAND is an executable in a PATH folder that isn't mise's (its shims or installs)."""
+    root = os.path.realpath(data or MISE_DATA) + os.sep
+    return any(os.access(os.path.join(d, command), os.X_OK) and not os.path.isdir(os.path.join(d, command))
+               for d in path_dirs if not (os.path.realpath(d) + os.sep).startswith(root))
+
+
+def commands(tool, version):
+    """The executables tool@version provides (from `mise bin-paths`)."""
+    r = subprocess.run([MISE, "bin-paths", f"{tool}@{version}"], cwd="/", capture_output=True, text=True)
+    names = set()
+    for d in r.stdout.split():
+        try:
+            names |= {n for n in os.listdir(d) if os.access(os.path.join(d, n), os.X_OK)}
+        except OSError:
+            pass
+    return names
+
+
+def render(tools):
+    if not tools:
+        return ""
+    return ("# Written by agentbox-mise-defaults on every sync: tools some project installed, whose\n"
+            "# commands exist only through mise. A project's own pin wins in that project.\n"
+            "[tools]\n" + "".join(f"{json.dumps(t)} = {json.dumps(v)}\n" for t, v in sorted(tools.items())))
+
+
+def main(argv):
+    r = subprocess.run([MISE, "ls", "--json"], cwd="/", capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(f"agentbox-mise-defaults: mise ls failed: {r.stderr.strip()[-300:]}")
+    path_dirs = [d for d in os.environ.get("PATH", "").split(":") if d] + ["/usr/local/bin", "/usr/bin", "/bin"]
+
+    def needs_default(tool, version):
+        names = commands(tool, version)
+        return bool(names) and not any(outside_mise(n, path_dirs) for n in names)
+
+    tools = defaults(json.loads(r.stdout or "{}"), needs_default)
+    text = render(tools)
+    if "--check" in argv:
+        print(text or "(nothing to set)", end="")
+        return
+    try:
+        old = open(CONF).read()
+    except OSError:
+        old = ""
+    if text == old:
+        return
+    if text:
+        os.makedirs(os.path.dirname(CONF), exist_ok=True)
+        with open(CONF + ".tmp", "w") as fh:
+            fh.write(text)
+        os.replace(CONF + ".tmp", CONF)
+        print("mise: outside the projects that pin them, these now resolve: "
+              + ", ".join(f"{t} {v}" for t, v in sorted(tools.items())))
+    else:
+        os.remove(CONF)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

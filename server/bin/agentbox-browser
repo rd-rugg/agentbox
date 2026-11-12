@@ -1,0 +1,385 @@
+#!/bin/bash
+# A visible browser on the box that you can use from your laptop, one per project:
+# you sign in to a site there, and the agents' browser tools (Playwright) work in
+# that same browser afterwards. Chromium runs on a virtual screen (Xvnc), and noVNC
+# shows that screen as a web page; everything listens on 127.0.0.1 only, and the
+# laptop reaches it through ssh (`box browser NAME` there).
+#   agentbox-browser start NAME [--persist] [--proxy|--no-proxy]   start or reuse; prints view=PORT
+#                         cdp=PORT proxy=PORT profile=ram|disk. --proxy sends the browser's traffic
+#                         through 127.0.0.1:PORT, a SOCKS tunnel the laptop provides; the choice
+#                         is kept for the project, so a start without either option keeps it
+#   agentbox-browser stop NAME | stop --all
+#                         start also prints router=PORT: every project's viewer is at
+#                         http://localhost:PORT/NAME/ there (agentbox-browser-router), the port
+#                         every laptop tab forwards, so box browser on the box can give a link
+#   agentbox-browser link NAME   such a link, valid 15 minutes, without the VNC password in it
+#   agentbox-browser chromium-path   the Chromium it uses (Playwright's newest build), for other tools
+#   agentbox-browser status [NAME]   running browsers: project, ports, profile
+#   agentbox-browser mcp PACKAGE     the agents' Playwright MCP server: in a project folder it
+#                         uses that project's browser, started on the agent's first browser
+#                         action; elsewhere Playwright's own headless browser, as before
+# The profile (cookies, sign-ins) lives in RAM unless --persist: then it's kept on disk
+# in ~/.local/share/agentbox/browser/NAME, so it also goes into the box's snapshots.
+set -euo pipefail
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+
+# RAM only (cookies are credentials): agentbox's /run/agentbox, else a per-user runtime
+# folder; never a folder on disk such as /tmp.
+if [ -w /run/agentbox ]; then RUN=/run/agentbox
+elif [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -w "$XDG_RUNTIME_DIR" ]; then RUN="$XDG_RUNTIME_DIR/agentbox"
+else RUN=""; fi
+STATE_DIR="${RUN:+$RUN/browser}"
+PERSIST_DIR="$HOME/.local/share/agentbox/browser"
+WORK="$HOME/work"
+SIZE=1280x800
+NOVNC="${AGENTBOX_NOVNC:-/usr/share/novnc}"   # noVNC's web page (Ubuntu's novnc package)
+VIEWER_JS="${AGENTBOX_VIEWER_JS:-/usr/local/share/agentbox/novnc}"   # our additions to it (install.sh)
+# The viewers' fixed port, forwarded by every laptop tab (BOX_BROWSER_VIEW_PORT, saved by install.sh).
+ROUTER_PORT=$(cat "$HOME/.config/agentbox/browser-view-port" 2>/dev/null || echo 18800)
+
+die() { echo "agentbox-browser: $*" >&2; exit 1; }
+is_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]; }
+valid_name() { is_name "$1" || die "not a project name: $1"; }
+viewer_ok() { command -v Xvnc >/dev/null && command -v vncpasswd >/dev/null && command -v websockify >/dev/null && [ -d "$NOVNC" ]; }
+free_port() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
+alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+cdp_up() { curl -fsS -m 2 "http://127.0.0.1:$1/json/version" >/dev/null 2>&1; }
+# Something accepts connections on 127.0.0.1:PORT, waiting up to TRIES tenths of a second.
+port_up() {
+  local i
+  for ((i = 0; i < ${2:-1}; i++)); do
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && return 0
+    ((i + 1 < ${2:-1})) && sleep 0.1
+  done
+  return 1
+}
+# Playwright's own Chromium (installed with BOX_PLAYWRIGHT=1), the newest build.
+chromium_bin() {
+  { ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome 2>/dev/null || true; } | sort -V | tail -1
+}
+# One state file per running project: KEY=VALUE lines (pids, ports, display, profile).
+state_get() { sed -n "s/^$2=//p" "$STATE_DIR/$1/state" 2>/dev/null | tail -1; }
+
+# End PID, waiting up to $2 tenths of a second before forcing it.
+end_pid() {
+  local pid="$1" wait="${2:-20}"
+  alive "$pid" || return 0
+  kill "$pid" 2>/dev/null || true
+  for _ in $(seq "$wait"); do alive "$pid" || return 0; sleep 0.1; done
+  kill -9 "$pid" 2>/dev/null || true
+}
+# The viewer's web folder: noVNC's own files, linked and never changed, with a vnc.html that
+# also loads agentbox-clipboard.js (the clipboard shared with the laptop). Without that
+# script, or with a noVNC whose page doesn't fit, it's noVNC's own folder as it is.
+viewer_dir() {
+  if [ -f "$VIEWER_JS/agentbox-clipboard.js" ] && grep -q '</head>' "$NOVNC/vnc.html" 2>/dev/null; then
+    echo "$STATE_DIR/$1/web"
+  else
+    echo "$NOVNC"
+  fi
+}
+viewer_web() {
+  local web f
+  web=$(viewer_dir "$1")
+  if [ "$web" = "$NOVNC" ]; then
+    echo "$NOVNC"
+    return
+  fi
+  rm -rf "$web" && mkdir -p "$web"
+  for f in "$NOVNC"/*; do [ "${f##*/}" = vnc.html ] || ln -s "$f" "$web/"; done
+  for f in "$VIEWER_JS"/*.js; do ln -s "$f" "$web/"; done
+  sed 's#</head>#    <script type="module" src="agentbox-clipboard.js"></script>\n</head>#' "$NOVNC/vnc.html" > "$web/vnc.html"
+  echo "$web"
+}
+
+# The viewer: noVNC's page (with the clipboard) and its WebSocket bridge to the VNC port.
+start_viewer() {
+  local name="$1" web
+  web=$(viewer_web "$name")
+  sed -i '/^view_pid=/d; /^web=/d' "$STATE_DIR/$name/state"
+  setsid websockify --web "$web" "127.0.0.1:$(state_get "$name" view)" "127.0.0.1:$(state_get "$name" vnc)" \
+    </dev/null >"$STATE_DIR/$name/view.log" 2>&1 8>&- &
+  { echo "view_pid=$!"; echo "web=$web"; } >> "$STATE_DIR/$name/state"
+}
+
+# Chromium first, given time to write out its profile (cookies), then its screen and viewer.
+stop_chrome() { end_pid "$(state_get "$1" chrome_pid)" 100; }
+stop_one() {
+  local name="$1" dir="$STATE_DIR/$1"
+  [ -d "$dir" ] || return 0
+  stop_chrome "$name"
+  end_pid "$(state_get "$name" view_pid)"
+  end_pid "$(state_get "$name" wm_pid)"
+  end_pid "$(state_get "$name" xvnc_pid)"
+  rm -rf "$dir"   # the RAM profile goes with it; a --persist profile stays in $PERSIST_DIR
+}
+
+start() {
+  local name="" persist=0 proxy="" a
+  for a in "$@"; do
+    case "$a" in
+      --persist) persist=1 ;;
+      --proxy) proxy=1 ;;
+      --no-proxy) proxy=0 ;;
+      -*) die "unknown option $a" ;;
+      *) name="$a" ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: agentbox-browser start NAME [--persist] [--proxy|--no-proxy]"
+  valid_name "$name"
+  [ -n "$RUN" ] || die "no RAM folder for the browser (/run/agentbox): run up.sh on your laptop"
+  mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+  # One start at a time on the box (the laptop and the relays of several projects may
+  # start at once, and they pick displays and ports). The processes started below get
+  # this descriptor closed (8>&-), or they would hold the lock for as long as they run.
+  exec 8>"$STATE_DIR/.start.lock"; flock 8
+  # Keeping sign-ins on disk is decided once per project: its folder there says so.
+  if [ "$persist" = 1 ]; then mkdir -p "$PERSIST_DIR/$name"; chmod 700 "$PERSIST_DIR" "$PERSIST_DIR/$name"; fi
+  [ -d "$PERSIST_DIR/$name" ] && persist=1
+  # The proxy choice and its port are kept beside the browser's folder: the relay starts the
+  # browser without options, and the laptop's tunnel expects the same port every time.
+  local prefs="$STATE_DIR/$name.prefs" proxy_port
+  if [ -z "$proxy" ]; then proxy=$(sed -n 's/^proxied=//p' "$prefs" 2>/dev/null || true); proxy=${proxy:-0}; fi
+  proxy_port=$(sed -n 's/^proxy=//p' "$prefs" 2>/dev/null || true)
+  if [ "$proxy" = 1 ] && [ -z "$proxy_port" ]; then proxy_port=$(free_port); fi
+  printf 'proxied=%s\nproxy=%s\n' "$proxy" "$proxy_port" > "$prefs"
+  local chrome dir="$STATE_DIR/$name"
+  chrome=$(chromium_bin)
+  [ -x "$chrome" ] || die "no Chromium on this box: set BOX_PLAYWRIGHT=1 on your laptop and run up.sh"
+  viewer_ok || die "the browser viewer isn't installed: set BOX_PLAYWRIGHT=1 on your laptop and run up.sh"
+
+  # Already running: reuse it, never losing its sign-ins over a setting.
+  if [ -f "$dir/state" ] && alive "$(state_get "$name" xvnc_pid)" && alive "$(state_get "$name" view_pid)"; then
+    if [ "$(state_get "$name" persist)" != "$persist" ]; then
+      echo "agentbox-browser: $name's browser is running with its sign-ins in RAM; they're kept on disk from its next start (box browser $name --stop, then start it again and sign in again)." >&2
+    fi
+    if [ "$(state_get "$name" proxied)" != "$proxy" ]; then
+      # Only Chromium restarts, on the same profile; sites that sign you in just for the
+      # browsing session may ask again.
+      echo "agentbox-browser: restarting $name's browser to change where its traffic goes; sites that sign you in only for a browsing session may ask again." >&2
+      stop_chrome "$name"
+      sed -i '/^proxied=/d; /^proxy=/d' "$dir/state"
+      { echo "proxied=$proxy"; echo "proxy=$([ "$proxy" = 1 ] && echo "$proxy_port")"; } >> "$dir/state"
+      launch_chrome "$name" "$chrome"
+    elif ! alive "$(state_get "$name" chrome_pid)"; then
+      launch_chrome "$name" "$chrome"   # the user closed its last window
+    fi
+    # A viewer started by older code (no clipboard): only it restarts, on the same port, and an
+    # open viewer page reconnects by itself.
+    if [ "$(state_get "$name" web)" != "$(viewer_dir "$name")" ]; then
+      end_pid "$(state_get "$name" view_pid)"
+      start_viewer "$name"
+      port_up "$(state_get "$name" view)" 30 || true
+    fi
+    if command -v jwm >/dev/null && ! alive "$(state_get "$name" wm_pid)"; then   # started without one
+      sed -i '/^wm_pid=/d' "$dir/state"
+      DISPLAY=":$(state_get "$name" display)" setsid jwm </dev/null >"$dir/wm.log" 2>&1 8>&- &
+      echo "wm_pid=$!" >> "$dir/state"
+    fi
+    ensure_router
+    report "$name"
+    return
+  fi
+  stop_one "$name"
+
+  mkdir -p "$dir" && chmod 700 "$dir"
+  local display=10 vnc view cdp
+  while [ -e "/tmp/.X11-unix/X$display" ] || [ -e "/tmp/.X$display-lock" ]; do display=$((display + 1)); done
+  vnc=$(free_port); view=$(free_port); cdp=$(free_port)
+  [ "$proxy" = 1 ] || proxy_port=""
+  local profile="$dir/profile"
+  if [ "$persist" = 1 ]; then profile="$PERSIST_DIR/$name"; mkdir -p "$profile"; chmod 700 "$PERSIST_DIR" "$profile"; fi
+  # A fresh VNC password per start: the viewer and VNC listen on 127.0.0.1 only, but a web
+  # page in this same browser could reach 127.0.0.1 too and would drive it without one.
+  # (VNC passwords are 8 characters; Xvnc slows down repeated wrong guesses.)
+  local password
+  password=$(python3 -c 'import secrets, string; print("".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8)))')
+  (umask 077; vncpasswd -f <<< "$password" > "$dir/vncpasswd")
+  {
+    echo "display=$display"; echo "vnc=$vnc"; echo "view=$view"; echo "cdp=$cdp"
+    echo "proxied=$proxy"; echo "proxy=$proxy_port"; echo "persist=$persist"; echo "profile=$profile"
+    echo "password=$password"
+  } > "$dir/state"
+
+  # The screen: an X server that is also the VNC server, on 127.0.0.1 only; the laptop
+  # reaches it through ssh. Its clipboard goes to the viewer (and from there to the laptop's)
+  # only when something is copied, not on every text selection (SendPrimary).
+  setsid Xvnc ":$display" -geometry "$SIZE" -depth 24 -localhost -rfbport "$vnc" \
+    -SecurityTypes VncAuth -PasswordFile "$dir/vncpasswd" -nolisten tcp -AlwaysShared -desktop "$name" \
+    -SendPrimary=0 \
+    </dev/null >"$dir/xvnc.log" 2>&1 8>&- &
+  echo "xvnc_pid=$!" >> "$dir/state"
+  start_viewer "$name"
+  for _ in $(seq 50); do [ -e "/tmp/.X11-unix/X$display" ] && break; sleep 0.1; done
+  # A tiny window manager, so each agent session's window (and yours) can be switched to from
+  # the taskbar in the viewer. Without JWM the windows still work but lie on top of each other.
+  if command -v jwm >/dev/null; then
+    DISPLAY=":$display" setsid jwm </dev/null >"$dir/wm.log" 2>&1 8>&- &
+    echo "wm_pid=$!" >> "$dir/state"
+  fi
+  launch_chrome "$name" "$chrome"
+  ensure_router
+  report "$name"
+}
+
+launch_chrome() {
+  local name="$1" chrome="$2" dir="$STATE_DIR/$1" args
+  # shellcheck disable=SC2054  # the commas are Chromium's --window-size=W,H
+  args=(--user-data-dir="$(state_get "$name" profile)"
+        --remote-debugging-address=127.0.0.1 --remote-debugging-port="$(state_get "$name" cdp)"
+        --no-first-run --no-default-browser-check --password-store=basic --disable-dev-shm-usage
+        --disk-cache-size=33554432   # 32 MB: a RAM profile shares the box's small /run
+        --window-position=0,0 --window-size="${SIZE/x/,}")
+  if [ "$(state_get "$name" proxied)" = 1 ]; then
+    # All traffic, DNS included, goes through the laptop's SOCKS tunnel; without the
+    # tunnel pages fail with a proxy error instead of quietly using the box's address.
+    args+=(--proxy-server="socks5://127.0.0.1:$(state_get "$name" proxy)"
+           --host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE 127.0.0.1")
+  fi
+  sed -i '/^chrome_pid=/d' "$dir/state"
+  DISPLAY=":$(state_get "$name" display)" setsid "$chrome" "${args[@]}" about:blank \
+    </dev/null >"$dir/chrome.log" 2>&1 8>&- &
+  echo "chrome_pid=$!" >> "$dir/state"
+  for _ in $(seq 100); do cdp_up "$(state_get "$name" cdp)" && break; sleep 0.1; done
+  cdp_up "$(state_get "$name" cdp)" || die "Chromium didn't start (see $dir/chrome.log)"
+}
+
+# The router on the fixed port: started with the first project browser, ended with the last
+# (a small Python process; nothing runs while no browser does). It runs under start's lock;
+# a router from older code is replaced, and a port something else holds is left alone.
+ensure_router() {
+  local f="$STATE_DIR/router.state" pid ver
+  pid=$(sed -n 's/^pid=//p' "$f" 2>/dev/null || true)
+  ver=$(md5sum < "$(dirname "$0")/agentbox-browser-router" | cut -c1-12)
+  if alive "$pid" && [ "$(sed -n 's/^port=//p' "$f")" = "$ROUTER_PORT" ] && [ "$(sed -n 's/^ver=//p' "$f")" = "$ver" ]; then
+    return 0
+  fi
+  end_pid "$pid"
+  rm -f "$f"
+  if port_up "$ROUTER_PORT"; then
+    echo "agentbox-browser: 127.0.0.1:$ROUTER_PORT is taken by something else on this box, so there are no links from the box (BOX_BROWSER_VIEW_PORT on the laptop picks another)." >&2
+    return 0
+  fi
+  setsid python3 "$(dirname "$0")/agentbox-browser-router" "$ROUTER_PORT" "$STATE_DIR" \
+    </dev/null >"$STATE_DIR/router.log" 2>&1 8>&- &
+  printf 'pid=%s\nport=%s\nver=%s\n' "$!" "$ROUTER_PORT" "$ver" > "$f"
+  port_up "$ROUTER_PORT" 30 || echo "agentbox-browser: the router didn't start: $(tail -1 "$STATE_DIR/router.log")" >&2
+}
+router_up() { alive "$(sed -n 's/^pid=//p' "$STATE_DIR/router.state" 2>/dev/null || true)" && port_up "$ROUTER_PORT"; }
+stop_router() {
+  local d
+  for d in "$STATE_DIR"/*/; do [ -f "$d/state" ] && return 0; done
+  end_pid "$(sed -n 's/^pid=//p' "$STATE_DIR/router.state" 2>/dev/null || true)"
+  rm -f "$STATE_DIR/router.state"
+}
+
+# A link to NAME's viewer through the router for the user, valid 15 minutes: the router
+# sends it on to the viewer with the VNC password, which so never appears where the link does.
+link() {
+  local name="${1:?usage: agentbox-browser link NAME}" f token now
+  valid_name "$name"
+  [ -n "$RUN" ] && [ -f "$STATE_DIR/$name/state" ] || die "the browser for $name isn't running"
+  router_up || die "no router on 127.0.0.1:$ROUTER_PORT on this box"
+  f="$STATE_DIR/$name/links"
+  now=$(date +%s)
+  token=$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')
+  (umask 077; { awk -v now="$now" '$2 > now' "$f" 2>/dev/null || true; echo "$token $((now + 900))"; } > "$f.new")
+  mv "$f.new" "$f"
+  echo "http://localhost:$ROUTER_PORT/$name/open?t=$token"
+}
+
+report() {
+  local name="$1"
+  echo "view=$(state_get "$name" view)"
+  echo "cdp=$(state_get "$name" cdp)"
+  echo "proxy=$(state_get "$name" proxy)"
+  if [ "$(state_get "$name" persist)" = 1 ]; then echo "profile=disk"; else echo "profile=ram"; fi
+  echo "password=$(state_get "$name" password)"
+  if router_up; then echo "router=$ROUTER_PORT"; fi
+}
+
+status() {
+  local d name
+  [ -n "$RUN" ] || return 0
+  for d in "$STATE_DIR"/*/; do
+    [ -f "$d/state" ] || continue
+    name=$(basename "$d")
+    [ -z "${1:-}" ] || [ "$1" = "$name" ] || continue
+    local up=down
+    cdp_up "$(state_get "$name" cdp)" && up=running
+    printf '%s\t%s\tview=%s\tcdp=%s\tproxy=%s\tprofile=%s\n' "$name" "$up" "$(state_get "$name" view)" \
+      "$(state_get "$name" cdp)" "$(state_get "$name" proxy)" \
+      "$([ "$(state_get "$name" persist)" = 1 ] && echo disk || echo ram)"
+  done
+}
+
+# The MCP server the agents start (registered by install.sh). In a project folder it uses
+# that project's browser, the one `box browser NAME` shows, through a small relay on a
+# fixed port: the relay starts the browser on the first connection (the agent's first
+# browser action), so nothing runs or uses memory before then, and a browser that was
+# stopped or restarted (say, to go through the laptop) comes back on the next action.
+# Outside a project folder: Playwright's own headless browser, throwaway profile.
+mcp() {
+  local package="${1:?usage: agentbox-browser mcp PACKAGE}" name="" port
+  shift
+  case "$PWD/" in "$WORK"/*/*) name="${PWD#"$WORK"/}"; name="${name%%/*}" ;; esac
+  if [ -n "$name" ] && is_name "$name" && [ -n "$RUN" ] && [ -n "$(chromium_bin)" ] && viewer_ok \
+      && port=$(relay "$name"); then
+    exec npx -y "$package" --cdp-endpoint "http://127.0.0.1:$port" "$@"
+  fi
+  exec npx -y "$package" --headless --browser chromium --isolated "$@"
+}
+
+# The project's relay port, starting the relay if it isn't running. Its state is kept
+# beside (not in) the browser's folder, so stopping the browser leaves the relay.
+relay() {
+  local name="$1" f="$STATE_DIR/$1.relay" port pid ver
+  mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+  exec 9>"$f.lock"; flock 9
+  port=$(sed -n 's/^port=//p' "$f" 2>/dev/null || true)
+  pid=$(sed -n 's/^pid=//p' "$f" 2>/dev/null || true)
+  # A relay from older code (before an update of the box) is replaced, on the same port, so
+  # agents that are already connected come back to the new one on their next action.
+  ver=$(cat "$0" "$(dirname "$0")/agentbox-browser-relay" 2>/dev/null | md5sum | cut -c1-12)
+  if [ -n "$port" ] && alive "$pid" && [ "$(sed -n 's/^ver=//p' "$f" 2>/dev/null)" != "$ver" ]; then
+    end_pid "$pid"
+    pid=""
+  fi
+  if [ -z "$port" ] || ! alive "$pid"; then
+    [ -n "$port" ] || port=$(free_port)
+    setsid "$0" --relay "$name" "$port" </dev/null >"$STATE_DIR/$name.relay.log" 2>&1 9>&- &
+    printf 'port=%s\npid=%s\nver=%s\n' "$port" "$!" "$ver" > "$f"
+    port_up "$port" 50 || true
+  fi
+  exec 9>&-
+  echo "$port"
+}
+
+# The relay itself (agentbox-browser-relay, beside this script): starts the browser on the
+# first request and gives each agent session its own window in the shared browser.
+run_relay() {
+  local name="$1" port="$2"
+  AGENTBOX_BROWSER="$0" exec python3 "$(dirname "$0")/agentbox-browser-relay" "$name" "$port"
+}
+
+case "${1:-}" in
+  start) shift; start "$@" ;;
+  stop)
+    [ -n "${2:-}" ] || die "usage: agentbox-browser stop NAME | --all"
+    [ -n "$RUN" ] || exit 0
+    mkdir -p "$STATE_DIR"
+    exec 8>"$STATE_DIR/.start.lock"; flock 8   # not while a start is halfway (it may need the router)
+    if [ "$2" = --all ]; then
+      for d in "$STATE_DIR"/*/; do [ -d "$d" ] && stop_one "$(basename "$d")"; done
+    else
+      valid_name "$2"; stop_one "$2"
+    fi
+    stop_router
+    ;;
+  status) status "${2:-}" ;;
+  link) link "${2:-}" ;;
+  chromium-path) chromium_bin ;;
+  mcp) shift; mcp "$@" ;;
+  --relay) run_relay "${2:?}" "${3:?}" ;;
+  *) awk 'NR > 1 && !/^#/ {exit} NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;   # the header comment
+esac

@@ -1,0 +1,5 @@
+# Paths that stay in the development repository: scripts/publish.sh leaves them out of every
+# release. A folder ends with /; globs work (*.local.md). Relative to the repository root.
+docs/plans/
+video/build/
+video/

@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Run a command (the tab's `tmux attach`) on its own terminal, passing everything through,
+except two pastes from the laptop's terminal that become Ctrl+V.
+
+Why: terminals (Windows Terminal, iTerm2, ...) turn Ctrl+V into a paste of the clipboard's
+text, so the key never arrives. When the clipboard holds only an image they send an empty
+paste (ESC[200~ ESC[201~); when it holds a copied file (Explorer, Finder), its path. Claude
+Code, running next to the terminal on macOS or WSL, reads the image in both cases; on Linux it
+does neither. In a box tab the image is on the laptop, which agentbox-clipboard (the box's
+xclip) reaches, so these pastes are handed on as the key Claude Code reads an image with:
+Ctrl+V. A pasted path becomes Ctrl+V only when it names an image that isn't on the box and
+the laptop's clipboard has an image; otherwise it is pasted as it was.
+
+  agentbox-tty COMMAND [ARG...]   exits with COMMAND's status
+"""
+import errno
+import fcntl
+import os
+import pty
+import re
+import select
+import subprocess
+import signal
+import struct
+import sys
+import termios
+import tty
+
+START, END = b"\x1b[200~", b"\x1b[201~"
+CTRL_V = b"\x16"
+HOLD = 0.2            # how long an unfinished paste (or the start of one) waits for the rest
+MAX_PASTE = 4096      # longer pastes are text: passed on as they arrive
+IMAGE_PATH = re.compile(rb"""^(["']?)((?:[A-Za-z]:\\|\\\\|/)[^\r\n"']*\.(?:png|jpe?g|gif|bmp|webp))\1$""", re.I)
+
+
+def image_path(text):
+    """The path a paste names, if it is one image file that isn't on this machine."""
+    m = IMAGE_PATH.match(text.strip())
+    if not m:
+        return None
+    path = m.group(2).decode(errors="replace")
+    return None if path.startswith("/") and os.path.exists(path) else path
+
+
+def laptop_has_image():
+    try:
+        return subprocess.run(["agentbox-clipboard", "has-image"], timeout=10,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+class Filter:
+    """Input bytes in, bytes for the command out: an empty paste, or one naming an image file
+    the laptop has, becomes Ctrl+V. A paste (or what may start one) is held until it is
+    complete, then passed on (`flush` passes on what is held, when no more comes)."""
+    def __init__(self, has_image=laptop_has_image):
+        self.held = b""
+        self.has_image = has_image
+
+    def feed(self, data):
+        data, out = self.held + data, b""
+        self.held = b""
+        while data:
+            i = data.find(START)
+            if i < 0:
+                for n in range(min(len(START) - 1, len(data)), 0, -1):
+                    if START.startswith(data[-n:]):   # maybe the start of a paste
+                        self.held = data[-n:]
+                        return out + data[:-n]
+                return out + data
+            out, data = out + data[:i], data[i:]
+            j = data.find(END, len(START))
+            if j < 0:
+                if len(data) > MAX_PASTE:   # a long paste is text
+                    return out + data
+                self.held = data
+                return out
+            body = data[len(START):j]
+            paste, data = data[:j + len(END)], data[j + len(END):]
+            out += CTRL_V if self.is_image(body) else paste
+        return out
+
+    def is_image(self, body):
+        return body == b"" or (len(body) < 1024 and image_path(body) is not None and self.has_image())
+
+    def flush(self):
+        out, self.held = self.held, b""
+        return out
+
+
+def copy_size(src_fd, dst_fd):
+    try:
+        size = fcntl.ioctl(src_fd, termios.TIOCGWINSZ, b"\0" * 8)
+        fcntl.ioctl(dst_fd, termios.TIOCSWINSZ, size)
+    except OSError:
+        pass
+
+
+def write_all(fd, data):
+    while data:
+        try:
+            n = os.write(fd, data)
+        except InterruptedError:
+            continue
+        data = data[n:]
+
+
+def run(argv):
+    if not os.isatty(0):
+        os.execvp(argv[0], argv)   # nothing to translate without a terminal
+    pid, master = pty.fork()
+    if pid == 0:
+        try:
+            os.execvp(argv[0], argv)
+        finally:
+            os._exit(127)
+    copy_size(0, master)
+    signal.signal(signal.SIGWINCH, lambda *_: copy_size(0, master))
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, lambda s, _f: os.kill(pid, s))
+    saved = termios.tcgetattr(0)
+    tty.setraw(0)
+    filt = Filter()
+    try:
+        while True:
+            try:
+                ready, _, _ = select.select([0, master], [], [], HOLD if filt.held else None)
+            except InterruptedError:
+                continue
+            if not ready and filt.held:
+                write_all(master, filt.flush())
+            if master in ready:
+                try:
+                    data = os.read(master, 1 << 16)
+                except OSError as e:
+                    if e.errno != errno.EIO:
+                        raise
+                    data = b""
+                if not data:
+                    break
+                write_all(1, data)
+            if 0 in ready:
+                try:
+                    data = os.read(0, 1 << 16)
+                except OSError:
+                    data = b""
+                if not data:   # the connection went: the command gets the hangup it would have
+                    try:
+                        os.kill(pid, signal.SIGHUP)
+                    except ProcessLookupError:
+                        pass
+                    break
+                write_all(master, filt.feed(data))
+    finally:
+        try:
+            termios.tcsetattr(0, termios.TCSAFLUSH, saved)
+        except termios.error:
+            pass
+        os.close(master)
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else status >> 8
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(__doc__.split("\n\n")[-1], file=sys.stderr)
+        sys.exit(2)
+    code = run(sys.argv[1:])
+    sys.exit(128 - code if code < 0 else code)

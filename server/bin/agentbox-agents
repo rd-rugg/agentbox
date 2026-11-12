@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Agents on this box that run outside agentbox's tmux sessions, whoever started them (another
+app's server such as T3 Code, a script, a shell outside tmux). `box --agents` runs it; the laptop
+shows the rows in `box ls` and refuses to close a box under a working one.
+
+One JSON line per conversation: {"pid", "agent", "folder", "starter", "last", "working"}.
+- agent: claude or codex; starter: the executable name of what started it (never its arguments)
+- folder: the agent's working folder (Codex: each open session file's own folder; one Codex
+  app-server can serve several threads)
+- last: when its conversation file last changed (epoch seconds), or null
+- working: the conversation changed in the last WINDOW seconds, or the agent's process tree
+  used at least BUSY of one core between two reads SAMPLE seconds apart (a long tool call
+  writes nothing; an idle agent's timers stay far below that)
+"""
+import json
+import os
+import re
+import sys
+import time
+
+AGENTS = ("claude", "codex")
+SHELLS = {"sh", "bash", "dash", "zsh", "fish", "env", "sudo", "setsid", "nohup", "timeout"}
+WINDOW = 30 * 60
+SAMPLE = 2.0
+BUSY = 0.05   # an idle Claude tree measured 1 tick in 2 s (0.5%); a build or test run uses far more
+SESSION_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def read_procs(proc="/proc"):
+    """pid -> {ppid, comm, exe (argv0's basename), args, cwd, cpu, fds}. cpu counts the process's
+    own ticks and those of its reaped children, so a build's short-lived compilers still count."""
+    procs = {}
+    for name in os.listdir(proc):
+        if not name.isdigit():
+            continue
+        base = os.path.join(proc, name)
+        try:
+            with open(os.path.join(base, "stat")) as fh:
+                stat = fh.read()
+            with open(os.path.join(base, "cmdline"), "rb") as fh:
+                argv = [a.decode(errors="replace") for a in fh.read().split(b"\0") if a]
+        except OSError:
+            continue
+        comm = stat[stat.index("(") + 1:stat.rindex(")")]
+        rest = stat[stat.rindex(")") + 2:].split()
+        p = {"ppid": int(rest[1]), "comm": comm, "exe": os.path.basename(argv[0]) if argv else "",
+             "args": argv[1:], "cpu": sum(int(t) for t in rest[11:15]), "cwd": None, "fds": []}
+        try:
+            p["cwd"] = os.readlink(os.path.join(base, "cwd"))
+        except OSError:
+            pass
+        procs[int(name)] = p
+    return procs
+
+
+def open_files(pid, proc="/proc"):
+    out = []
+    try:
+        for fd in os.listdir(os.path.join(proc, str(pid), "fd")):
+            try:
+                out.append(os.readlink(os.path.join(proc, str(pid), "fd", fd)))
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return out
+
+
+def agent_of(p):
+    for a in AGENTS:
+        if p["comm"] == a or p["exe"] == a:
+            return a
+    return None
+
+
+def ancestors(procs, pid):
+    seen = set()
+    pid = procs[pid]["ppid"]
+    while pid in procs and pid not in seen and pid > 1:
+        seen.add(pid)
+        yield pid
+        pid = procs[pid]["ppid"]
+
+
+def outside(procs):
+    """Top-level agent processes with no tmux server among their ancestors: pid -> agent."""
+    found = {}
+    for pid, p in procs.items():
+        a = agent_of(p)
+        if not a:
+            continue
+        up = list(ancestors(procs, pid))
+        if any(procs[u]["comm"].startswith("tmux") for u in up):
+            continue
+        if any(agent_of(procs[u]) for u in up):   # a helper of another agent counts with it
+            continue
+        found[pid] = a
+    return found
+
+
+def starter(procs, pid):
+    for u in ancestors(procs, pid):
+        name = procs[u]["comm"]
+        if name not in SHELLS:
+            return name
+    return None
+
+
+def tree(procs, pid):
+    kids = {pid}
+    changed = True
+    while changed:
+        changed = False
+        for q, p in procs.items():
+            if q not in kids and p["ppid"] in kids:
+                kids.add(q)
+                changed = True
+    return kids
+
+
+def dashed(path):
+    """Claude Code's project folder name: every non-alphanumeric character becomes '-'."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def session_id(p):
+    """The conversation a Claude process runs, when its arguments name one (--session-id,
+    --resume/-r ID); tab sessions always do. Used to tell conversations apart, never shown."""
+    args = p.get("args") or []
+    for i, a in enumerate(args[:-1]):
+        if a in ("--session-id", "--resume", "-r") and SESSION_ID.match(args[i + 1]):
+            return args[i + 1]
+    return None
+
+
+def newest(folder, only=None, skip=()):
+    """The newest transcript time in a Claude project folder, subagent transcripts included
+    (<id>.jsonl and <id>/subagents/...). only: just conversation `only`; skip: not these."""
+    best = None
+    for root, _dirs, names in os.walk(folder):
+        rel = os.path.relpath(root, folder)
+        for name in names:
+            if not name.endswith(".jsonl"):
+                continue
+            conv = name[:-6] if rel == "." else rel.split(os.sep)[0]
+            if (only and conv != only) or conv in skip:
+                continue
+            try:
+                t = os.path.getmtime(os.path.join(root, name))
+            except OSError:
+                continue
+            best = t if best is None or t > best else best
+    return best
+
+
+def codex_folder(path):
+    try:
+        with open(path) as fh:
+            return json.loads(fh.readline()).get("payload", {}).get("cwd")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def conversations(procs, pid, agent, home, files=open_files, tab_ids=()):
+    """(folder, last) per conversation of this agent. A Claude agent's conversation is the one
+    its arguments name, else the folder's newest one that no tab session runs (tab_ids)."""
+    p = procs[pid]
+    if agent == "claude":
+        folder = p["cwd"]
+        if not folder:
+            return [(None, None)]
+        project = os.path.join(home, ".claude", "projects", dashed(folder))
+        own = session_id(p)
+        return [(folder, newest(project, only=own) if own else newest(project, skip=set(tab_ids)))]
+    sessions = os.path.join(home, ".codex", "sessions") + os.sep
+    seen = []
+    for q in sorted(tree(procs, pid)):
+        for f in files(q):
+            if f.startswith(sessions) and f.endswith(".jsonl") and f not in seen:
+                seen.append(f)
+    if not seen:
+        return [(None, None)]
+    out = []
+    for f in seen:
+        try:
+            last = os.path.getmtime(f)
+        except OSError:
+            last = None
+        out.append((codex_folder(f), last))
+    return out
+
+
+def tab_conversations(procs):
+    """The conversations Claude runs in the tmux sessions (they belong to the tabs)."""
+    found = outside(procs)
+    return {session_id(p) for pid, p in procs.items()
+            if agent_of(p) == "claude" and pid not in found and session_id(p)}
+
+
+def rows(procs, now, busy, home, files=open_files):
+    """The output rows; busy: pids whose process tree used at least BUSY of a core in the sample."""
+    out = []
+    tabs = tab_conversations(procs)
+    for pid, agent in sorted(outside(procs).items()):
+        for folder, last in conversations(procs, pid, agent, home, files, tabs):
+            recent = last is not None and now - last < WINDOW
+            out.append({"pid": pid, "agent": agent, "folder": folder, "starter": starter(procs, pid),
+                        "last": int(last) if last else None, "working": bool(recent or pid in busy)})
+    return out
+
+
+def cpu(procs, pids):
+    return sum(procs[q]["cpu"] for q in pids if q in procs)
+
+
+def busy_pids(before, after, found, ticks_per_sec, sample=SAMPLE):
+    """Agents whose process tree used at least BUSY of one core between the two reads. Each read
+    sums its own tree: children started during the sample count, and a child that ended has
+    moved its ticks into its parent's (reaped children's) count."""
+    floor = BUSY * ticks_per_sec * sample
+    return {pid for pid in found if cpu(after, tree(after, pid)) - cpu(before, tree(before, pid)) >= floor}
+
+
+def main():
+    before = read_procs()
+    found = outside(before)
+    busy = set()
+    if found:
+        time.sleep(SAMPLE)
+        busy = busy_pids(before, read_procs(), found, os.sysconf("SC_CLK_TCK"))
+    for row in rows(before, time.time(), busy, os.path.expanduser("~")):
+        print(json.dumps(row))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

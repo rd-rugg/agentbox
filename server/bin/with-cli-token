@@ -1,0 +1,30 @@
+#!/bin/sh
+# Installed as ~/.local/bin/<tool> (symlink). Runs the real <tool> with its
+# token from Bitwarden (CLI__<VAR>) when that secret exists, so no login is needed.
+tool=$(basename "$0")
+case "$tool" in
+  gh) var=GH_TOKEN ;;
+  railway) var=RAILWAY_API_TOKEN ;;
+  *) echo "with-cli-token: unknown tool $tool" >&2; exit 1 ;;
+esac
+
+# The real binary: first match on PATH that isn't this wrapper's directory.
+self_dir=$(cd "$(dirname "$0")" && pwd)
+real=
+IFS=:
+for dir in $PATH; do
+  [ "$dir" = "$self_dir" ] && continue
+  if [ -x "$dir/$tool" ]; then real="$dir/$tool"; break; fi
+done
+unset IFS
+[ -n "$real" ] || { echo "$tool is not installed" >&2; exit 127; }
+
+if [ "$tool" = gh ]; then
+  getter="github-token"   # GitHub App installation token when configured, else CLI__GH_TOKEN
+else
+  getter="secrets --get cli $var"
+fi
+if [ -z "$(printenv "$var")" ] && token=$($getter 2>/dev/null); then
+  export "$var=$token"
+fi
+exec "$real" "$@"

@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""MCP servers on the box (installed as /usr/local/bin/agentbox-mcp by install.sh).
+
+  agentbox-mcp apply              read the laptop's servers (JSON on stdin, from mcp_sync.py),
+                                  register them for Claude and Codex, report what changed
+                                  (lines starting "note:" are standing notes, not changes)
+  agentbox-mcp codex-compose      write ~/.codex/config.toml: the laptop's settings, its MCP
+                                  servers, the box's own servers, the OAuth callback port
+  agentbox-mcp headers KEY        print a server's secret headers as JSON (a headers helper)
+  agentbox-mcp run KEY -- CMD...  run a stdio server with its secret variables
+
+Secret values come from Bitwarden (`secrets --get cli MCP_...`) only when a server
+starts, into memory; files here hold only the secrets' names. Servers agentbox added
+are recorded (~/.config/agentbox/mcp-manifest.json), so a server removed on the laptop
+is removed here, while one added on the box itself, or changed here since, is left alone.
+"""
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+CONF = os.path.join(HOME, ".config", "agentbox")
+MANIFEST = os.path.join(CONF, "mcp-manifest.json")
+SECRETS = os.path.join(CONF, "mcp-secrets.json")      # server -> Bitwarden names, never values
+CODEX_SERVERS = os.path.join(CONF, "mcp-codex.json")  # the laptop's Codex servers, as for the box
+BOX_SERVERS = os.path.join(CONF, "mcp-box.json")      # agentbox's own for Codex (install.sh: playwright)
+PORT_FILE = os.path.join(CONF, "mcp-callback-port")
+BOX_NAMES = {"playwright"}   # servers only agentbox sets up on the box; never kept as the box's own
+CLAUDE_JSON = os.path.join(HOME, ".claude.json")
+CODEX_DIR = os.path.join(HOME, ".codex")
+PATH = os.pathsep.join([os.path.join(HOME, ".local/bin"), os.path.join(HOME, ".local/share/mise/shims"),
+                        "/usr/local/bin", "/usr/bin", "/bin"])
+
+
+# Where a remote server's sign-in happens: in a box tab, which forwards the callback port.
+SIGN_IN = {"claude": "; sign in once with /mcp in a box session if it asks",
+           "codex": "; sign in once from a box tab: Ctrl+b c, then codex mcp login {}"}
+
+
+def digest(d):
+    return hashlib.sha256(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def load(path, default):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def save(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def plan_changes(desired, current, manifest):
+    """What to do so the box has the laptop's servers without touching its own.
+    desired/current: {name: definition}; manifest: {name: {"want", "have"}}, digests of
+    what agentbox asked for last and of what the agent stored for it. Returns
+    (set {name: def}, remove [names], kept {name: why}, unchanged [names])."""
+    to_set, remove, kept, same = {}, [], {}, []
+    for name, d in desired.items():
+        cur, m = current.get(name), manifest.get(name)
+        if cur is not None and not m:
+            if cur != d:
+                kept[name] = "the box has its own server by that name; left as it is"
+            continue   # the box's own (identical or not): never adopted, so never removed
+        if cur is not None and (cur == d or (m["want"] == digest(d) and m["have"] == digest(cur))):
+            same.append(name)
+        elif cur is not None and digest(cur) != m["have"]:
+            kept[name] = "changed on the box; left as it is (remove it there to take the laptop's)"
+        else:
+            to_set[name] = d
+    for name, m in manifest.items():
+        if name in desired:
+            continue
+        cur = current.get(name)
+        if cur is not None and digest(cur) == m["have"]:
+            remove.append(name)
+        elif cur is not None:
+            kept[name] = "gone from the laptop but changed on the box; left as it is"
+    return to_set, remove, kept, same
+
+
+def resolve(d):
+    """A stdio server's command as an absolute path on the box, or a problem."""
+    if "command" not in d:
+        return d, None
+    d = dict(d)
+    if d["command"] == "agentbox-mcp":   # the wrapper: check the real command after "--"
+        args = list(d.get("args") or [])
+        real = args[args.index("--") + 1] if "--" in args else ""
+        found = shutil.which(real, path=PATH)
+        if not found:
+            return None, f"its command {real} isn't installed on the box"
+        args[args.index("--") + 1] = found
+        d["args"], d["command"] = args, shutil.which("agentbox-mcp", path=PATH) or "/usr/local/bin/agentbox-mcp"
+    else:
+        found = shutil.which(d["command"], path=PATH)
+        if not found:
+            return None, f"its command {d['command']} isn't installed on the box"
+        d["command"] = found
+    for a in d.get("args") or []:
+        if isinstance(a, str) and a.startswith(HOME + "/") and not os.path.exists(a):
+            return None, f"it uses {a}, which the box doesn't have"
+    return d, None
+
+
+def secret_names():
+    """The CLI__ secret names in Bitwarden; None when Bitwarden can't be read right now."""
+    r = subprocess.run(["secrets", "cli"], capture_output=True, text=True)
+    if r.returncode == 0:
+        return set(r.stdout.split())
+    return set() if "No secrets for" in r.stderr else None
+
+
+UNKNOWN = "Bitwarden couldn't be read just now; left as it is until the next sync"
+
+
+def usable(key, d, refs, have):
+    """The definition ready for the box, or (None, why)."""
+    needs = sorted({r["secret"] for part in (refs or {}).values() for r in part.values()})
+    if needs and have is None:
+        return None, UNKNOWN
+    missing = [n for n in needs if n not in have]
+    if missing:
+        return None, "add " + ", ".join("CLI__" + n for n in missing) + " to Bitwarden to bring it"
+    return resolve(d)
+
+
+def claude_current():
+    return load(CLAUDE_JSON, {}).get("mcpServers", {}) or {}
+
+
+def claude(cmd):
+    return subprocess.run(["claude", "mcp", *cmd], capture_output=True, text=True,
+                          env=dict(os.environ, PATH=PATH + os.pathsep + os.environ.get("PATH", "")))
+
+
+def codex_current():
+    try:
+        import tomllib
+        with open(os.path.join(CODEX_DIR, "config.toml"), "rb") as fh:
+            return tomllib.load(fh).get("mcp_servers", {})
+    except (OSError, ValueError, ImportError):
+        return {}
+
+
+def apply():
+    payload = json.load(sys.stdin)
+    refs_all = payload.get("secrets") or {}
+    have = secret_names() if refs_all else set()
+    old_refs = load(SECRETS, {})
+    manifest = load(MANIFEST, {})
+    report, new_manifest, frozen = [], dict(manifest), set()
+
+    agents = [("claude", payload.get("claude") or {})]
+    if payload.get("codex") is not None:
+        agents.append(("codex", payload["codex"]))
+    for agent, servers in agents:
+        current = claude_current() if agent == "claude" else codex_current()
+        old = manifest.get(agent, {})
+        desired = {}
+        for name, d in servers.items():
+            ready, why = usable(f"{agent}:{name}", d, refs_all.get(f"{agent}:{name}"), have)
+            if ready is not None:
+                desired[name] = ready
+            elif why == UNKNOWN and name in old and name in current:
+                desired[name] = current[name]   # keep what works until Bitwarden answers
+                frozen.add(f"{agent}:{name}")
+                report.append(f"note: {agent} {name}: {why}")
+            else:
+                report.append(f"note: {agent} {name}: not set up: {why}")
+        to_set, remove, kept, same = plan_changes(desired, current, old)
+        new = {n: old[n] for n in same}
+        if agent == "claude":
+            for name in remove:
+                claude(["remove", "--scope", "user", name])
+            for name, d in to_set.items():
+                if name in current:
+                    claude(["remove", "--scope", "user", name])
+                r = claude(["add-json", "--scope", "user", name, json.dumps(d)])
+                if r.returncode:
+                    report.append(f"claude {name}: couldn't add: {(r.stderr or r.stdout).strip()[-200:]}")
+                    if name in current:   # put the working one back
+                        claude(["add-json", "--scope", "user", name, json.dumps(current[name])])
+                        if name in old:
+                            new[name] = old[name]
+                    continue
+                new[name] = {"want": digest(d), "have": digest(claude_current().get(name, d))}
+        else:
+            managed = {n: desired[n] for n in (*same, *to_set)}
+            for name in to_set:
+                new[name] = {"want": digest(desired[name]), "have": digest(desired[name])}
+            save(CODEX_SERVERS, managed)
+            compose_codex(drop=(set(old) | set(managed)) - set(kept))
+        report += [f"{agent} {n}: removed (gone from the laptop)" for n in remove]
+        report += [f"{agent} {n}: {'updated' if n in current else 'added'}" + (SIGN_IN[agent].format(n) if "url" in d else "")
+                   for n, d in to_set.items() if n in new]
+        report += [f"note: {agent} {n}: {why}" for n, why in kept.items()]
+        new_manifest[agent] = new
+    # Bitwarden names for the servers that use them; a frozen server keeps its old ones.
+    save(SECRETS, {**{k: v for k, v in refs_all.items() if k not in frozen},
+                   **{k: old_refs[k] for k in frozen if k in old_refs}})
+    save(MANIFEST, new_manifest)
+    print("\n".join(report))
+
+
+# --- Codex's config.toml ---
+
+def toml_str(s):
+    return json.dumps(s, ensure_ascii=False)   # a TOML basic string is JSON-compatible
+
+
+def toml_value(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, str):
+        return toml_str(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(toml_value(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{ " + ", ".join(f"{toml_key(k)} = {toml_value(x)}" for k, x in v.items()) + " }"
+    raise ValueError(f"can't write {type(v).__name__} to TOML")
+
+
+def toml_key(k):
+    return k if k and all(c.isalnum() or c in "_-" for c in k) else toml_str(k)
+
+
+def toml_servers(servers):
+    """[mcp_servers.NAME] tables; nested tables are written inline."""
+    out = []
+    for name, d in servers.items():
+        out.append(f"\n[mcp_servers.{toml_key(name)}]")
+        out += [f"{toml_key(k)} = {toml_value(v)}" for k, v in d.items()]
+    return "\n".join(out) + ("\n" if out else "")
+
+
+def compose_codex(drop=None):
+    """config.toml = the callback port, the laptop's settings, the laptop's MCP servers,
+    agentbox's own (mcp-box.json, written by install.sh: playwright), the servers added
+    on the box itself (`codex mcp add` there), trust for ~/work.
+    drop: server names agentbox writes or removed (default: the ones it manages)."""
+    managed, box = load(CODEX_SERVERS, {}), load(BOX_SERVERS, {})
+    if drop is None:
+        drop = set(load(MANIFEST, {}).get("codex", {})) | set(managed)
+    # agentbox's own servers are rewritten from mcp-box.json every time (so turning one off
+    # removes it), and win over a laptop server of the same name.
+    managed = {n: d for n, d in managed.items() if n not in box}
+    own = {n: d for n, d in codex_current().items() if n not in drop and n not in box and n not in BOX_NAMES}
+    port = open(PORT_FILE).read().strip() if os.path.exists(PORT_FILE) else ""
+    laptop = os.path.join(CODEX_DIR, "config.laptop.toml")
+    parts = [f"mcp_oauth_callback_port = {int(port)}\n" if port.isdigit() else ""]
+    if os.path.exists(laptop):
+        with open(laptop) as fh:
+            parts.append(fh.read())
+    parts += [toml_servers(managed), toml_servers(box), toml_servers(own)]
+    parts.append(f'\n[projects.{toml_str(os.path.join(HOME, "work"))}]\ntrust_level = "trusted"\n')
+    os.makedirs(CODEX_DIR, exist_ok=True)
+    tmp = os.path.join(CODEX_DIR, "config.toml.new")
+    with open(tmp, "w") as fh:
+        fh.write("".join(parts))
+    os.replace(tmp, os.path.join(CODEX_DIR, "config.toml"))
+
+
+# --- At server start: secret values into memory ---
+
+ARG_SECRET = "@@agentbox-secret:{}@@"   # an argument's placeholder (mcp_sync.py writes it)
+
+
+def values(key, part):
+    refs = (load(SECRETS, {}).get(key) or {}).get(part) or {}
+    out = {}
+    for field, ref in refs.items():
+        r = subprocess.run(["secrets", "--get", "cli", ref["secret"]], capture_output=True, text=True)
+        if r.returncode:
+            sys.exit(f"agentbox-mcp: CLI__{ref['secret']} isn't in Bitwarden (needed by {key})")
+        out[field] = ref.get("prefix", "") + r.stdout.rstrip("\n")
+    return out
+
+
+def main(argv):
+    cmd = argv[0] if argv else ""
+    if cmd == "apply":
+        apply()
+    elif cmd == "codex-compose":
+        compose_codex()
+    elif cmd == "headers" and len(argv) == 2:
+        print(json.dumps(values(argv[1], "headers")))
+    elif cmd == "run" and len(argv) >= 4 and argv[2] == "--":
+        env = dict(os.environ, **values(argv[1], "env"))
+        args = argv[3:]
+        for name, value in values(argv[1], "args").items():
+            args = [a.replace(ARG_SECRET.format(name), value) for a in args]
+        os.execvpe(args[0], args, env)
+    else:
+        print(__doc__.strip())
+        sys.exit(0 if cmd in ("-h", "--help") else 1)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
