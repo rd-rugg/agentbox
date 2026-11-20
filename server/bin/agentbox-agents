@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Agents on this box that run outside agentbox's tmux sessions, whoever started them (another
-app's server such as T3 Code, a script, a shell outside tmux). `box --agents` runs it; the laptop
+app's server such as T3 Code, a script, a shell outside tmux, or another tmux server such as a
+build runner's `tmux -L builds`: agentbox's tabs are on the default tmux server only). `box --agents` runs it; the laptop
 shows the rows in `box ls` and refuses to close a box under a working one.
 
 One JSON line per conversation: {"pid", "agent", "folder", "starter", "last", "working"}.
@@ -82,15 +83,35 @@ def ancestors(procs, pid):
         pid = procs[pid]["ppid"]
 
 
+def tmux_socket(p):
+    """The socket a tmux server process serves, from the command that started it: "default",
+    the -L name, or the -S path. None if p isn't a tmux server."""
+    if not p["comm"].startswith("tmux"):
+        return None
+    args = p.get("args") or []
+    for i, a in enumerate(args):
+        for flag in ("-L", "-S"):
+            if a == flag and i + 1 < len(args):
+                return args[i + 1]
+            if a.startswith(flag) and len(a) > 2:
+                return a[2:]
+    return "default"
+
+
+def is_agentbox_tmux(p):
+    sock = tmux_socket(p)
+    return sock is not None and os.path.basename(sock) == "default"
+
+
 def outside(procs):
-    """Top-level agent processes with no tmux server among their ancestors: pid -> agent."""
+    """Top-level agent processes not under agentbox's own (default) tmux server: pid -> agent."""
     found = {}
     for pid, p in procs.items():
         a = agent_of(p)
         if not a:
             continue
         up = list(ancestors(procs, pid))
-        if any(procs[u]["comm"].startswith("tmux") for u in up):
+        if any(is_agentbox_tmux(procs[u]) for u in up):
             continue
         if any(agent_of(procs[u]) for u in up):   # a helper of another agent counts with it
             continue
@@ -100,6 +121,9 @@ def outside(procs):
 
 def starter(procs, pid):
     for u in ancestors(procs, pid):
+        sock = tmux_socket(procs[u])
+        if sock is not None:   # another tmux server: say which, it names who runs it
+            return f"tmux -S {sock}" if "/" in sock else f"tmux -L {sock}"
         name = procs[u]["comm"]
         if name not in SHELLS:
             return name

@@ -23,8 +23,11 @@ When memory runs out, every session crawls and the kernel kills the biggest proc
   runners with at most 2 workers (`pytest -n 2`, `vitest --maxWorkers=2`), and never
   a backend and a frontend suite at the same time: together they can exhaust the
   memory, and the whole box then freezes for every session until the user resets it.
-- Don't kill other sessions' processes; tell the user what you see (`box --ls`,
-  `tmux ls` show the sessions).
+- If memory still runs out, earlyoom ends the likeliest culprit (a test runner, a language
+  server, a headless browser, a dev server) before the box freezes; a run that died that way
+  shows "Killed". Run it again narrower, not in a loop.
+- Don't kill other sessions' processes; tell the user what you see (`box ls` shows this box's
+  projects, sessions and load; `box price` what it costs per hour).
 - Disk: `df -h ~`. Clean build caches you created rather than letting it fill up.
 - If it's consistently too small, the user can run `box resize TYPE` on the laptop
   (`box prices` there lists types, e.g. cx33 = 4 vCPU/8 GB; 1-2 minutes, sessions

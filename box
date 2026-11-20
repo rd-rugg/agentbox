@@ -361,9 +361,16 @@ open_one() {
   case "$state" in
     up) return 0 ;;
     down|none) ;;   # from its snapshot, below
-    off|starting)
+    off|starting|half-closed)
       # A server that exists but doesn't run: billed already, so no new cost. Sessions a
       # close saved before it stopped (box --save) come back; tmux didn't survive the stop.
+      # A half-closed box opens as it is: the close's mark goes, its snapshot stays the
+      # newest until the next close.
+      if [ "$state" = half-closed ]; then
+        echo "$NAME is half-closed (a close stopped before deleting it); opening it as it is..."
+        hcloud server remove-label "$NAME" closing >/dev/null
+        state=$(server_status)
+      fi
       if [ "$state" = off ]; then
         echo "$NAME is switched off (billed all the same); powering it on..."
         hcloud server poweron "$NAME" >/dev/null || return 1
@@ -472,6 +479,11 @@ for line in sys.stdin:
 ls_one() {
   "$BOX_REPO/status.sh"
   [ "$(server_status)" = running ] || return 0
+  if ! box_answers; then
+    echo "  Hetzner shows $NAME running but it doesn't answer: usually it ran out of memory. Wait a few"
+    echo "  minutes, or reset it (it stops every agent; files and conversations stay): hcloud server reset $NAME"
+    return 0
+  fi
   show_load
   echo
   echo "Projects in ~/work:"
@@ -542,6 +554,7 @@ ls_json() {
       [ -n "$b" ] || continue
       printf 'box\t%s\t%s\t%s\t%s\t%s\n' "$b" "$state" "$type" "$eur" "$projs"
       [ "$state" = up ] || continue
+      on_box "$b" box_answers || continue   # running but not answering: no load or sessions to report
       on_box "$b" bssh 'echo "load	$(box --load)"; box --ls | sed "s/^/project	/"; tmux list-sessions -F "session	#{session_name}	#{session_activity}" 2>/dev/null || true
         if '"$BOX_HAS_AGENTS"'; then box --agents | sed "s/^/agent	/"; fi' </dev/null 2>/dev/null || true
     done < <(pool boxes)
@@ -667,6 +680,7 @@ cmd_resize() {
       echo "Starting $b..."
       wait_ssh 60 || { echo "$b doesn't answer yet; run up.sh to repair the connection." >&2; exit 1; }
       push_bws_token
+      push_price   # the new type's price, for box price on the box
       bssh 'box --restore'
     ) || exit 1
     sync_all "$b"   # .env files (env_files) live in RAM, which the restart emptied
@@ -799,7 +813,7 @@ cmd_open() {  # [BOX | --all] [--yes]
     st=$(pool state "$b")
     case "$st" in
       up) continue ;;
-      off|starting) closed+=("$b") ;;   # billed already: open_one powers it on or waits
+      off|starting|half-closed) closed+=("$b") ;;   # billed already: open_one powers it on or waits
       down|none) bill_gate open "$b" "$requested" || exit 1; closed+=("$b") ;;
       *) echo "$b is $st; not opened ($(box_state_hint "$st" "$b"))." >&2; skipped=1 ;;
     esac
@@ -1334,7 +1348,18 @@ cmd_check() {
 # with unpushed work is only warned about. Run it from a timer on the laptop, or
 # later from a controller elsewhere; the state it needs lives in Hetzner.
 cmd_tick() {
-  local b h
+  local b h state
+  # A close that stopped part way left a switched-off server that bills on: nothing runs
+  # on it, so finishing the close loses nothing.
+  while IFS=$'\t' read -r b state _; do
+    [ "$state" = half-closed ] || continue
+    if [ -n "$BOX_AUTO_CLOSE_HOURS" ]; then
+      echo "$b is half-closed (a close stopped before deleting it): finishing the close."
+      on_box "$b" "$BOX_REPO/down.sh" </dev/null || echo "⚠  $b wasn't closed (see above)."
+    else
+      echo "⚠  $b is half-closed: a close stopped before deleting the server, which bills on. Run: box close $b"
+    fi
+  done < <(pool boxes)
   while IFS=$'\t' read -r b h; do
     if [ -n "$BOX_AUTO_CLOSE_HOURS" ] && awk "BEGIN { exit !($h >= $BOX_AUTO_CLOSE_HOURS) }"; then
       echo "$b has been idle for ${h}h: closing it (BOX_AUTO_CLOSE_HOURS=$BOX_AUTO_CLOSE_HOURS)."

@@ -244,6 +244,7 @@ box_state_hint() {  # STATE BOX
   case "$1" in
     off) echo "switched off, billed while it exists: box open $2 powers it on, box close $2 saves and deletes it" ;;
     closing) echo "box close is saving a snapshot, then deletes the server" ;;
+    half-closed) echo "a close stopped before deleting the server, which bills on: box close $2 finishes it, keeping the snapshot it made" ;;
     starting|stopping) echo "billed" ;;
     up|down|none|"") ;;
     *) echo "Hetzner reports it $1; billed" ;;
@@ -268,6 +269,17 @@ use_box() {
   BOX_SSH_OPTS=()
 }
 bscp() { scp "${BOX_SSH_OPTS[@]}" "$@"; }
+
+# Run a command in a process of its own: a new session, and its parent gone, so ending
+# this script, its terminal, or the agent session that ran it (which ends the whole process
+# tree or group) doesn't end the command. Redirect its input and output.
+detach() {
+  python3 -c 'import os, sys
+if os.fork():
+    os._exit(0)
+os.setsid()
+os.execvp(sys.argv[1], sys.argv[1:])' "$@"
+}
 
 # Labels of a server or image as key=value lines.
 server_labels() { hcloud server describe "$1" -o json 2>/dev/null | labels_json; }
@@ -327,6 +339,13 @@ close_public_ssh() {
     && echo "Temporary public SSH closed."
   unset SSH_RULE
   BOX_SSH_OPTS=()
+}
+
+# Whether box $NAME answers over ssh within a few seconds. A box that runs out of memory keeps
+# its network up but answers nothing, and a shared connection to it can hang for minutes.
+box_answers() {
+  timeout 15 ssh "${BOX_SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=6 -o ControlPath=none "$NAME" true \
+    </dev/null >/dev/null 2>&1
 }
 
 wait_ssh() {  # $1: attempts (3 s apart)
@@ -406,6 +425,24 @@ back_to_tailnet() {
 
 # Install ./server onto the box (see server/install.sh), hand over the
 # Bitwarden token, and optionally mirror your Claude Code setup.
+# What box $NAME costs, for agents on it (box price there): its type, location and Hetzner's
+# hourly and monthly price there, incl. VAT. Only the laptop can ask Hetzner; written on every
+# sync and after a resize.
+push_price() {
+  hcloud server describe "$NAME" -o json 2>/dev/null | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+t = s["server_type"]
+loc = (s.get("location") or (s.get("datacenter") or {}).get("location") or {}).get("name")
+p = next((p for p in t["prices"] if p["location"] == loc), None)
+if p:
+    print(json.dumps({"box": s["name"], "type": t["name"], "location": loc, "currency": "EUR",
+                      "hourly": round(float(p["price_hourly"]["gross"]), 4),
+                      "monthly_cap": round(float(p["price_monthly"]["gross"]), 2)}))' 2>/dev/null \
+    | bssh 'mkdir -p ~/.config/agentbox && f=~/.config/agentbox/price.json && t=$(cat) && [ -n "$t" ] && echo "$t" > "$f"' \
+    || true
+}
+
 sync_config() {
   echo "Syncing config from $SERVER_DIR..."
   bssh 'rm -rf /tmp/agentbox-sync'
@@ -414,6 +451,7 @@ sync_config() {
   [ "$BOX_AGENT_SYNC" = 1 ] && [[ " $BOX_AGENTS " == *" codex "* ]] && sync_codex_config
   bssh "$(printf 'BWS_VERSION=%q PLAYWRIGHT_MCP_VERSION=%q BOX_NAME=%q BOX_GIT_NAME=%q BOX_GIT_EMAIL=%q BOX_DOCKER=%q BOX_PLAYWRIGHT=%q BOX_AGENTS=%q BOX_MCP_CALLBACK_PORT=%q BOX_BROWSER_VIEW_PORT=%q BOX_T3=%q %sbash /tmp/agentbox-sync/install.sh' \
     "$BWS_VERSION" "$PLAYWRIGHT_MCP_VERSION" "$NAME" "$BOX_GIT_NAME" "$BOX_GIT_EMAIL" "$BOX_DOCKER" "$BOX_PLAYWRIGHT" "$BOX_AGENTS" "$(mcp_port)" "$(view_port)" "$BOX_T3" "$(permission_env)")"
+  push_price
   [ "$BOX_AGENT_SYNC" = 1 ] && sync_claude
   sync_windows_ssh
   return 0

@@ -3,12 +3,13 @@
 
 State is kept as labels on the Hetzner resources, so any laptop (or a future
 controller) sees the same thing and nothing has to run permanently:
-  server / snapshot  app=<box>  p.<project>=1  sessions=<n> (snapshots)
+  server / snapshot  app=<box>  p.<project>=1  sessions=<n>
+  server             closing=<unix time> from the start of box close until the server is deleted
   firewall <pool>    lock=<host>.<expiry> while a laptop creates or moves boxes
 Pool membership follows from the name: <pool> and <pool>-<n>.
 
   pool.py boxes                  box<TAB>state<TAB>type<TAB>eur_per_hour<TAB>projects
-                                 (state: up, down, off, starting, stopping, closing; box_state)
+                                 (state: up, down, off, starting, stopping, closing, half-closed; box_state)
   pool.py state BOX              that box's state (none if it has no server or snapshot)
   pool.py where PROJECT          the box a project is placed on (its label; empty if none)
   pool.py place PROJECT BOX      record the placement (label on the server, or its snapshot)
@@ -39,6 +40,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import projects  # noqa: E402
@@ -78,12 +80,19 @@ def box_names():
     return [POOL] + [f"{POOL}-{i}" for i in range(2, MAX_BOXES + 1)]
 
 
-def box_state(status, closing=False):
+HALF_CLOSED_AFTER = 1800  # seconds: a close's label this old, with no snapshot being made, is a stopped close
+
+
+def box_state(status, closing=False, stopped=False):
     """A box's state from its server's Hetzner status: "up" only while it runs. Every
     other existing server still bills: "closing" while box close works on it (down.sh labels
-    the server closing=1 until it's deleted; a snapshot of it being made, or Hetzner
-    deleting it, says the same), "off" when it was switched off without being closed,
-    "starting"/"stopping" in between. "down" is a closed box: a snapshot, no server."""
+    the server closing=<time> until it's deleted; a snapshot of it being made, or Hetzner
+    deleting it, says the same), "half-closed" when a close stopped before deleting the
+    server (close_stopped: box close finishes it), "off" when it was switched off without
+    being closed, "starting"/"stopping" in between. "down" is a closed box: a snapshot, no
+    server."""
+    if stopped:
+        return "half-closed"
     if closing or status == "deleting":
         return "closing"
     if status == "running":
@@ -91,6 +100,37 @@ def box_state(status, closing=False):
     if status in ("initializing", "starting"):
         return "starting"
     return status or "unknown"
+
+
+def close_began(server):
+    """When box close began on SERVER (its closing label, seconds since 1970), or None: no
+    label, or closing=1 from before the label carried the time."""
+    began = (server.get("labels") or {}).get("closing", "")
+    return int(began) if began.isdigit() and int(began) > 10 ** 9 else None
+
+
+def snapshot_time(image):
+    try:
+        return datetime.fromisoformat(image["created"].replace("Z", "+00:00")).timestamp()
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return 0.0
+
+
+def close_stopped(server, images, now):
+    """Whether a box close stopped part way on SERVER, which then bills on, switched off:
+    the agent session or terminal that ran it ended, or the laptop went down. down.sh keeps
+    the server's closing label to the end, so the label is still there, no snapshot of the
+    server is being made, and either one it made is finished (only the delete is left) or
+    the label is older than HALF_CLOSED_AFTER."""
+    began = close_began(server)
+    if began is None or server.get("status") == "deleting":
+        return False
+    mine = [i for i in images if (i.get("created_from") or {}).get("id") == server.get("id")]
+    if any(i.get("status") == "creating" for i in mine):
+        return False
+    if any(i.get("status") == "available" and snapshot_time(i) >= began for i in mine):
+        return True
+    return now - began > HALF_CLOSED_AFTER
 
 
 def members():
@@ -111,8 +151,9 @@ def members():
         t = s["server_type"]
         loc = s.get("location", {}).get("name")
         price = next((float(p["price_hourly"]["gross"]) for p in t["prices"] if p["location"] == loc), 0.0)
-        closing = s["id"] in saving or (s.get("labels") or {}).get("closing") == "1"
-        boxes[s["name"]] = {"box": s["name"], "state": box_state(s.get("status"), closing), "server": True,
+        closing = s["id"] in saving or "closing" in (s.get("labels") or {})
+        state = box_state(s.get("status"), closing, close_stopped(s, images, time.time()))
+        boxes[s["name"]] = {"box": s["name"], "state": state, "server": True,
                             "type": t["name"], "eur_h": price,
                             "labels": s.get("labels", {}), "id": s["id"]}
     for img in sorted(images, key=lambda i: i["id"]):

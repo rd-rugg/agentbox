@@ -48,7 +48,21 @@ ROOTS = [(".claude/CLAUDE.md", "claude/CLAUDE.md", "claude"), (".claude/rules", 
 NEVER_PUSHED = {".agents/skills/agentbox", ".agents/skills/agentbox-setup", ".agents/skills/agentbox-onboard"}
 # Never touched on the box: agentbox's box skill (server/install.sh) and the skills Claude
 # Code itself syncs from your claude.ai account, which it does on each machine.
-BOX_ONLY = {".claude/skills/agentbox-box", ".agents/skills/agentbox-box", ".claude/skills/synced"}
+# Claude Code's own trash for removed skills is its business too.
+BOX_ONLY = {".claude/skills/agentbox-box", ".agents/skills/agentbox-box", ".claude/skills/synced",
+            ".claude/skills/.trash", ".agents/skills/.trash"}
+
+
+def grouped(paths):
+    """Changed paths shown per item of a root (a skill folder, a rules file), with a file count:
+    a skill with 150 files changed on the box is one line, not 150."""
+    roots = sorted((r[0] for r in ROOTS), key=len, reverse=True)
+    counts = {}
+    for p in paths:
+        root = next((r for r in roots if p == r or p.startswith(r + "/")), None)
+        key = p if root is None or p == root else root + "/" + p[len(root) + 1:].split("/", 1)[0]
+        counts[key] = counts.get(key, 0) + 1
+    return [k if n == 1 else f"{k} ({n} files)" for k, n in sorted(counts.items())]
 
 
 def roots_for(agents):
@@ -274,7 +288,7 @@ def sync(agents="claude", mode=None, quiet=False):
     if updated or removed or not quiet:
         print(f"agent setup: {updated} updated, {removed} removed on {BOX}")
     if changed:
-        print(f"agent setup: changed or added on {BOX}, kept as they are: " + ", ".join(sorted(changed)))
+        print(f"agent setup: changed or added on {BOX}, kept as they are: " + ", ".join(grouped(changed)))
         if mode is None:
             print("  box sync --pull-setup brings them to the laptop, box sync --push-setup overwrites them")
     mcp_sync.sync(agents, quiet)

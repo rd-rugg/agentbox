@@ -122,6 +122,13 @@ fi
 # runs without swap until then, its zram0 left half set up, hence the reset). The swap
 # unit is started explicitly: restarting the setup service doesn't start it. A failure
 # here only warns.
+# Reset zram0 (half set up after a restart into a new kernel, or by systemd's own start racing
+# this one, which then fails with "Device or resource busy") and start the swap on it.
+zram_start() {
+  { [ ! -e /sys/block/zram0/reset ] || { sudo swapoff /dev/zram0 2>/dev/null; echo 1 | sudo tee /sys/block/zram0/reset >/dev/null; }; } \
+    && sudo systemctl restart systemd-zram-setup@zram0.service \
+    && sudo systemctl start dev-zram0.swap
+}
 if ! swapon --show=NAME --noheadings | grep -q zram; then
   say "setting up compressed swap in RAM (zram)"
   { modinfo zram >/dev/null 2>&1 || apt_install "linux-modules-extra-$(uname -r)"; } \
@@ -130,10 +137,30 @@ if ! swapon --show=NAME --noheadings | grep -q zram; then
     && echo 'vm.swappiness = 100' | sudo tee /etc/sysctl.d/90-agentbox-zram.conf >/dev/null \
     && sudo sysctl -q -p /etc/sysctl.d/90-agentbox-zram.conf \
     && sudo systemctl daemon-reload \
-    && { [ ! -e /sys/block/zram0/reset ] || echo 1 | sudo tee /sys/block/zram0/reset >/dev/null; } \
-    && sudo systemctl restart systemd-zram-setup@zram0.service \
-    && sudo systemctl start dev-zram0.swap \
+    && sudo modprobe zram && sudo udevadm settle \
+    && { zram_start 2>/dev/null || { sleep 3; zram_start; }; } \
     || say "couldn't set up zram swap; the box runs without swap"
+fi
+
+# earlyoom: when memory and swap run out, it ends the likeliest culprit (a test runner, a language
+# server, a headless browser, a dev server) before the box freezes for every session, and never an
+# agent or the box's own services. /etc/default/earlyoom is agentbox's when it is missing, has
+# agentbox's first line, or is still the package's own; anything else is the user's and is left alone.
+earlyoom_conf='# agentbox: rewritten on every sync; delete this line to keep your own settings
+EARLYOOM_ARGS="-r 3600 -m 6 -s 50 --prefer (^|/)(tsserver|typescript-langu|vitest|jest|esbuild|workerd|chrome|chromium|chrome-headless|headless_shell)$ --avoid (^|/)(claude|codex|sshd|tailscaled|tmux.*|systemd.*|dockerd|containerd|postgres|t3)$"'
+if command -v earlyoom >/dev/null || apt_install earlyoom; then
+  earlyoom_pkg=$(dpkg-query -W -f='${Conffiles}\n' earlyoom 2>/dev/null | awk '$1 == "/etc/default/earlyoom" {print $2}')
+  if [ ! -f /etc/default/earlyoom ] || head -1 /etc/default/earlyoom | grep -q '^# agentbox:' \
+      || [ "$(md5sum < /etc/default/earlyoom | cut -d' ' -f1)" = "$earlyoom_pkg" ]; then
+    if [ "$(cat /etc/default/earlyoom 2>/dev/null)" != "$earlyoom_conf" ]; then
+      printf '%s\n' "$earlyoom_conf" | sudo tee /etc/default/earlyoom >/dev/null
+      sudo systemctl restart earlyoom 2>/dev/null || true
+    fi
+  fi
+  systemctl is-enabled earlyoom >/dev/null 2>&1 || sudo systemctl enable --now earlyoom >/dev/null 2>&1 \
+    || say "earlyoom didn't start; see: systemctl status earlyoom"
+else
+  say "couldn't install earlyoom; a box that runs out of memory can freeze until it's reset"
 fi
 
 # RAM-only folder for the Bitwarden token and file secrets; never in a snapshot.

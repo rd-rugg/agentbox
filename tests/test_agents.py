@@ -52,6 +52,17 @@ class AgentsOutsideTabs(unittest.TestCase):
         self.assertEqual((row["pid"], row["agent"], row["folder"], row["starter"]), (21, "claude", "/home/dev/work/b", "t3"))
         self.assertTrue(row["working"])
 
+    def test_agents_on_another_tmux_server_are_outside_the_tabs(self):
+        def server(*args):
+            return {**proc(1, "tmux: server"), "args": list(args)}
+        procs = {50: server("new-session", "-d", "-s", "web"), 51: proc(50, "bash"), 52: proc(51, "claude"),
+                 60: server("-L", "builds", "new-session", "-d", "-s", "myapp"), 61: proc(60, "bash"),
+                 62: proc(61, "claude", cwd="/home/dev/work/myapp.streams/ui"),
+                 70: server("-S", "/tmp/tmux-1000/default", "new"), 71: proc(70, "claude"),
+                 80: server("-S/tmp/runner.sock", "new"), 81: proc(80, "codex")}
+        rows = {r["pid"]: r["starter"] for r in self.rows(procs)}
+        self.assertEqual(rows, {62: "tmux -L builds", 81: "tmux -S /tmp/runner.sock"})
+
     def test_the_starter_is_the_first_non_shell_ancestor_by_name_only(self):
         procs = {30: proc(1, "node", exe="node"), 31: proc(30, "bash"), 32: proc(31, "claude")}
         self.assertEqual(self.rows(procs)[0]["starter"], "node")

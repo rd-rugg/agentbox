@@ -7,6 +7,8 @@
 #   box NAME | attach NAME  attach to NAME, starting its agent in ~/work/NAME if needed
 #   box clone OWNER/REPO [NAME]  clone into ~/work/NAME and install the tool versions it pins
 #   box doctor              tool versions, secrets, GitHub and Tailscale status
+#   box ls [--json] | status  this box's projects and sessions, its load and what it costs
+#   box price [--json]      what this box costs per hour (written by the laptop on every sync)
 #   box browser [NAME] [--stop]  start (or stop) the project's browser and print a link to it
 #                           for the user (Ctrl+click in a box tab): they sign in to a site there
 #                           before you use it. NAME defaults to the project of this folder
@@ -524,6 +526,62 @@ PY
   attach | new)
     start "${2:?usage: box attach NAME}"
     exec tmux attach -t "=$2"
+    ;;
+  price)
+    price_file="$HOME/.config/agentbox/price.json"
+    [ -s "$price_file" ] || { echo "No price recorded yet: the laptop writes it on its next sync (box open, up.sh)." >&2; exit 1; }
+    if [ "${2:-}" = --json ]; then cat "$price_file"; else python3 -c '
+import json, sys
+p = json.load(open(sys.argv[1]))
+b, t, l, h, m = (p[k] for k in ("box", "type", "location", "hourly", "monthly_cap"))
+print(f"{b}: {t} in {l}, €{h:.4f}/h (at most €{m:.2f}/month), while it exists")' "$price_file"; fi
+    ;;
+  ls|status)
+    # On the box, box ls is about this box (the laptop's box ls covers every box). --json has the
+    # laptop's shape, {"boxes": [...]} with this one box, so one reader handles both.
+    if [ "${2:-}" = --json ]; then
+      { echo "price	$(cat "$HOME/.config/agentbox/price.json" 2>/dev/null || true)"
+        echo "load	$("$0" --load)"
+        "$0" --ls | sed "s/^/project	/"
+        tmux list-sessions -F "session	#{session_name}	#{session_activity}" 2>/dev/null || true
+        "$0" --agents 2>/dev/null | sed "s/^/agent	/" || true; } | python3 -c '
+import json, socket, sys
+box = {"name": None, "state": "up", "type": None, "eur_per_hour": None, "load": None,
+       "projects": [], "sessions": [], "agents_outside": []}
+for line in sys.stdin:
+    kind, _, rest = line.rstrip("\n").partition("\t")
+    if kind == "price" and rest:
+        p = json.loads(rest)
+        box.update(name=p.get("box"), type=p.get("type"), location=p.get("location"),
+                   eur_per_hour=p.get("hourly"), eur_per_month_cap=p.get("monthly_cap"))
+    elif kind == "load" and rest:
+        box["load"] = json.loads(rest)
+    elif kind == "project":
+        f = rest.split("\t")
+        box["projects"].append({"name": f[0], "status": f[1], "last_activity": float(f[2]) if f[2] else None,
+                                "agents": f[4] if len(f) > 4 else ""})
+    elif kind == "session":
+        name, _, act = rest.partition("\t")
+        box["sessions"].append({"name": name, "last_activity": int(act) if act.isdigit() else None})
+    elif kind == "agent" and rest:
+        box["agents_outside"].append(json.loads(rest))
+box["name"] = box["name"] or socket.gethostname()
+print(json.dumps({"boxes": [box]}, indent=2))'
+    else
+      "$0" price 2>/dev/null || true
+      echo "Sessions: $(tmux list-sessions -F "#{session_name}" 2>/dev/null | paste -sd" " - || true)"
+      "$0" --ls | awk -F'\t' '{printf "  %-24s %s%s\n", $1, $2, ($5 ? " (" $5 ")" : "")}'
+    fi
+    ;;
+  open|close|add|check|sync|data|login|setup|tick|t3|names|ssh|session|stop|resize|move|prices|plan|budget)
+    # The laptop's commands: a session with that name would start here by mistake (a runner's
+    # box ls once did). A project folder of that name still opens.
+    if [ ! -d "$WORK/$1" ]; then
+      echo "box $1 is a command of the laptop's box. On the box: box [NAME], box ls, box price, box doctor, box browser, box clone." >&2
+      exit 1
+    fi
+    start "$1"
+    exec tmux attach -t "=$1"
     ;;
   *)
     start "$1"

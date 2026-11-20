@@ -8,7 +8,7 @@ allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/box close) Bash(${CLAUDE_PLUGIN_ROOT}/
 The user asked to close their box (with several boxes: all of them, unless
 they named one, e.g. `box close agentbox-2`, or asked for idle ones: `box close --idle`). Run `${CLAUDE_PLUGIN_ROOT}/box close` with a
 Bash timeout of 600000. If it stops because work exists only on the box
-(uncommitted or unpushed), or because agents outside the tabs (T3 Code's) are working,
+(uncommitted or unpushed), or because agents outside the tabs (T3 Code's, or a build runner's on its own tmux server) are working,
 show what it listed and ask: push it or let them finish first, or close anyway with `box
 close BOX --force` for that box (the work stays in the snapshot; working agents are
 stopped mid-turn; `--force` without BOX forces every box). A refused close leaves the box up and

@@ -36,10 +36,13 @@ Every command below is `${CLAUDE_PLUGIN_ROOT}/box …`, run on the laptop.
 **Is it up, what does it cost, is it busy?** `box ls` (state, type, price,
 budget, a load line with free memory/swap/CPU and a warning when it's overloaded,
 projects, sessions). `box ls --json` for parsing. Down: `box plan` shows the
-type and price an open would pick. A box listed `off`, `starting`, `stopping` or
-`closing` has a server that doesn't run and still bills: `box open BOX` powers an
-`off` one on (no new cost, so no `--yes` needed); a `closing` one is being saved by
-`box close`, so wait for it.
+type and price an open would pick. A box listed `off`, `starting`, `stopping`,
+`closing` or `half-closed` has a server that doesn't run and still bills: `box open BOX`
+powers an `off` one on (no new cost, so no `--yes` needed); a `closing` one is being
+saved by `box close`, so wait for it; a `half-closed` one is a close that stopped before
+deleting the server: `box close BOX` finishes it (nothing runs there to lose). `box
+close` finishes in a process of its own, so a background command ending early doesn't
+stop it.
 
 **Open / close.** Confirm first (money, running work), unless the user asked for
 exactly that. Before opening a down box, run `box plan` and tell the user the type
@@ -53,7 +56,7 @@ stops; ask which, then `box open BOX`). Run by you, `box open` with one box, or
 deletes; it refuses while work exists only on the box (uncommitted/unpushed), listing
 it: push it, or `box close BOX --force` for that box with the user's OK (the work
 stays in the snapshot; without BOX, `--force` applies to every box). `--force` also
-skips the check for agents working outside the tabs (T3 Code's), stopping them mid-turn:
+skips the check for agents working outside the tabs (T3 Code's, or those on another tmux server such as a build runner's), stopping them mid-turn:
 say so when asking. A refused close
 leaves the box up and billing: the command exits non-zero, and `box ls` shows which
 boxes are still up.

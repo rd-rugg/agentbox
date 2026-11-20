@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -156,6 +157,16 @@ class AgentSetup(unittest.TestCase):
                 self.assertEqual(origin[".claude/skills/box-extra/SKILL.md"], os.path.join(ov, "claude/skills/box-extra/SKILL.md"))
             finally:
                 shutil.rmtree(out)
+
+    def test_the_sync_report_groups_a_skills_files_and_skips_claude_codes_trash(self):
+        self.assertEqual(agent_setup.grouped([".claude/skills/big/SKILL.md", ".claude/skills/big/ref/a.md",
+                                              ".claude/skills/one/SKILL.md", ".claude/CLAUDE.md"]),
+                         [".claude/CLAUDE.md", ".claude/skills/big (2 files)", ".claude/skills/one"])
+        with tempfile.TemporaryDirectory() as home:
+            for rel in (".claude/skills/.trash/123/x/SKILL.md", ".claude/skills/kept/SKILL.md"):
+                os.makedirs(os.path.dirname(os.path.join(home, rel)), exist_ok=True)
+                open(os.path.join(home, rel), "w").close()
+            self.assertEqual(sorted(agent_setup.hashes(home, [".claude/skills"])), [".claude/skills/kept/SKILL.md"])
 
     def test_changed_on_box(self):
         manifest = {"a": "1", "b": "2", "c": "3"}
@@ -697,6 +708,22 @@ class BoxScript(unittest.TestCase):
             files = self.run_box(home, "--files", "web").split()
             self.assertIn(".t3/worktrees/web/feature", files)
             self.assertIn(".codex/sessions/s.jsonl", files)   # past folders without transcripts too
+
+    def test_ls_and_price_describe_this_box_and_laptop_commands_start_nothing(self):
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, "work", "web"))
+            os.makedirs(os.path.join(home, ".config", "agentbox"))
+            self.assertEqual(self.run_box(home, "price"), "")            # nothing recorded yet
+            with open(os.path.join(home, ".config", "agentbox", "price.json"), "w") as fh:
+                json.dump({"box": "agentbox-4", "type": "ccx13", "location": "hel1", "currency": "EUR",
+                           "hourly": 0.0632, "monthly_cap": 39.45}, fh)
+            self.assertIn("agentbox-4: ccx13 in hel1, €0.0632/h", self.run_box(home, "price"))
+            box = json.loads(self.run_box(home, "ls", "--json"))["boxes"][0]   # the laptop's shape
+            self.assertEqual((box["name"], box["type"], box["eur_per_hour"]), ("agentbox-4", "ccx13", 0.0632))
+            self.assertEqual([p["name"] for p in box["projects"]], ["web"])
+            self.assertIn("web", self.run_box(home, "ls"))
+            self.assertEqual(self.run_box(home, "open"), "")           # refused, on stderr
+            self.assertFalse(os.path.exists(self.socket(home)))         # no tmux session started
 
     def test_claude_login_ignores_mcp_sign_ins(self):
         with tempfile.TemporaryDirectory() as home:
@@ -1553,6 +1580,20 @@ class BoxStates(unittest.TestCase):
         self.assertEqual(pool.box_state("starting"), "starting")
         self.assertEqual(pool.box_state("stopping"), "stopping")
         self.assertEqual(pool.box_state(None), "unknown")
+        self.assertEqual(pool.box_state("off", closing=True, stopped=True), "half-closed")
+
+    def test_a_close_that_stopped_is_told_from_one_at_work(self):
+        import pool
+        snap = {"id": 9, "status": "available", "created": "2027-01-15T08:00:00Z", "created_from": {"id": 2}}
+        now = int(pool.snapshot_time(snap)) + 30
+        srv = {"id": 2, "status": "off", "labels": {"closing": str(now - 60)}}   # began just before the snapshot
+        self.assertFalse(pool.close_stopped(srv, [], now))                        # between its steps
+        self.assertFalse(pool.close_stopped(srv, [{**snap, "status": "creating"}], now))
+        self.assertTrue(pool.close_stopped(srv, [snap], now))                     # only the delete was left
+        self.assertFalse(pool.close_stopped(srv, [{**snap, "created_from": {"id": 3}}], now))
+        self.assertTrue(pool.close_stopped(srv, [], now + pool.HALF_CLOSED_AFTER))  # stopped before the snapshot
+        self.assertFalse(pool.close_stopped({**srv, "labels": {"closing": "1"}}, [snap], now))  # an older close's label
+        self.assertFalse(pool.close_stopped({**srv, "labels": {}}, [snap], now))
 
 
 class PlacementScript(unittest.TestCase):
@@ -1581,6 +1622,12 @@ if a[:2] == ["image", "list"]: out(s["images"])
 if a[:2] == ["server", "describe"]:
     srv = server(a[2])
     fmt = next((x for x in a if x.startswith("format=")), "")
+    if srv and "json" in a:
+        t = srv["server_type"]
+        out({**srv, "created": "2026-11-01T10:00:00+00:00", "public_net": {"ipv4": {"ip": "192.0.2.10"}},
+             "server_type": {**t, "cores": 2, "memory": 4, "disk": 40,
+                             "prices": [{**p, "price_monthly": {"gross": "5.93"}} for p in t["prices"]]},
+             "primary_disk_size": 40})
     if srv and "Status" in fmt:
         print(srv.get("status", "running"))
     elif srv and "ServerType.Name" in fmt:
@@ -1589,6 +1636,8 @@ if a[:2] == ["server", "describe"]:
         print(srv["location"]["name"])
     elif srv and "PrimaryDiskSize" in fmt:
         print(40)
+    elif srv and "ID" in fmt:
+        print(srv["id"])
     sys.exit(0 if srv else 1)
 if a[:2] == ["server-type", "list"]:
     def t(name, ram, disk, price):
@@ -1608,10 +1657,33 @@ if a[:2] == ["server", "change-type"]:
         json.dump(s, fh)
     sys.exit(0)
 if a[:2] == ["image", "describe"]: print("40"); sys.exit(0)
+def save():
+    with open(state_file, "w") as fh:
+        json.dump(s, fh)
+if a[:2] == ["server", "create-image"]:
+    import time
+    time.sleep(float(os.environ.get("FAKE_SNAPSHOT_S", "0")))
+    with open(state_file) as fh:
+        s = json.load(fh)
+    srv = server(a[-1])
+    labels = dict(a[i + 1].split("=", 1) for i, x in enumerate(a) if x == "--label")
+    s["images"].append({"id": max([i["id"] for i in s["images"]] + [1000]) + 1, "status": "available",
+                        "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 1)),
+                        "created_from": {"id": srv["id"]}, "labels": labels})
+    save(); sys.exit(0)
+if a[:2] == ["server", "delete"]:
+    s["servers"] = [x for x in s["servers"] if x["name"] != a[2]]
+    save(); sys.exit(0)
+if a[:2] == ["image", "delete"]:
+    s["images"] = [x for x in s["images"] if str(x["id"]) != a[2]]
+    save(); sys.exit(0)
+if a[:2] == ["server", "poweroff"]:
+    server(a[2])["status"] = "off"
+    save(); sys.exit(0)
 if a[0] in ("server", "image") and a[1] in ("add-label", "remove-label"):
     items = s["servers"] if a[0] == "server" else s["images"]
     rest = [x for x in a[2:] if x != "--overwrite"]
-    it = next(x for x in items if str(x["id"]) == rest[0])
+    it = next(x for x in items if rest[0] in (str(x["id"]), x.get("name")))
     if a[1] == "add-label":
         k, v = rest[1].split("=", 1); it["labels"][k] = v
     else:
@@ -1755,6 +1827,16 @@ exit 0
                                 "labels": {"app": name}})
         self.write_state(s)
 
+    def test_ls_gives_up_quickly_on_a_box_that_doesnt_answer(self):
+        rc, out, calls = self.box("ls", FAKE_SSH_DOWN="agentbox-2")   # (the stand-in hcloud describes no server: rc varies)
+        self.assertIn("agentbox-2 running but it doesn't answer", out)
+        self.assertNotIn("ssh agentbox-2 box --ls", calls)
+        self.assertNotIn("ssh agentbox-2 box --load", calls)
+        rc, out, calls = self.box("ls", "--json", FAKE_SSH_DOWN="agentbox-2")
+        self.assertIn('"agentbox-2"', out)
+        self.assertFalse([c for c in calls.splitlines() if c.startswith("ssh agentbox-2 ") and "box --load" in c])
+        self.assertTrue([c for c in calls.splitlines() if c.startswith("ssh agentbox-3 ") and "box --load" in c])
+
     def test_ls_shows_an_off_server_as_off_not_up(self):
         # a box whose server exists but is switched off was listed as "up"
         self.set_server("agentbox-2", "off")
@@ -1799,6 +1881,80 @@ exit 0
         self.assertIn("agentbox-2 is closing", out)
         self.assertNotIn("poweron", calls)
 
+    def test_close_snapshots_deletes_and_drops_the_older_snapshot(self):
+        s = self.read_state()
+        s["images"].append({"id": 800, "status": "available", "labels": {"app": "agentbox-2"}})
+        self.write_state(s)
+        rc, out, calls = self.box("close", "agentbox-2", "--force")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Done. Saved as snapshot 1001", out)
+        s = self.read_state()
+        self.assertNotIn("agentbox-2", [x["name"] for x in s["servers"]])
+        snaps = {i["id"]: i["labels"] for i in s["images"]}
+        self.assertNotIn(800, snaps)
+        self.assertEqual(snaps[1001]["app"], "agentbox-2")
+        self.assertEqual(snaps[1001]["p.acme"], "1")
+        self.assertIn("sessions", snaps[1001])
+
+    def test_close_finishes_when_what_ran_it_is_killed(self):
+        # an agent session ran box close in the background and ended mid-snapshot, which
+        # killed its process group: the server stayed, switched off and billed
+        e = {"PATH": f"{self.bin}:{os.environ['PATH']}", "HOME": self.home, "BOX_MAX_BOXES": "3",
+             "BOX_CONF": os.path.join(self.conf, "box.conf"), "FAKE_STATE": self.state, "FAKE_LOG": self.log,
+             "XDG_CONFIG_HOME": os.path.join(self.home, ".config"), "BOX_TERMINAL": "print", "FAKE_SNAPSHOT_S": "2"}
+        p = subprocess.Popen(["bash", self.BOX, "close", "agentbox-2", "--force"], env=e, start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(100):
+            if os.path.exists(self.log):
+                with open(self.log) as fh:
+                    if "create-image" in fh.read():
+                        break
+            time.sleep(0.1)
+        os.killpg(p.pid, signal.SIGKILL)
+        p.wait()
+        for _ in range(100):
+            if "agentbox-2" not in [x["name"] for x in self.read_state()["servers"]]:
+                break
+            time.sleep(0.1)
+        self.assertNotIn("agentbox-2", [x["name"] for x in self.read_state()["servers"]])
+        self.assertTrue(any(i["labels"].get("app") == "agentbox-2" for i in self.read_state()["images"]))
+
+    def half_close(self):
+        # what a close that stopped after its snapshot leaves: the server off, still labelled
+        s = self.read_state()
+        srv = next(x for x in s["servers"] if x["name"] == "agentbox-2")
+        srv["status"] = "off"
+        srv["labels"]["closing"] = str(int(time.time()) - 600)
+        s["images"].append({"id": 950, "status": "available", "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "created_from": {"id": srv["id"]}, "labels": {"app": "agentbox-2", "p.acme": "1", "sessions": "1"}})
+        self.write_state(s)
+
+    def test_a_stopped_close_shows_and_the_next_close_finishes_it(self):
+        self.half_close()
+        rc, out, calls = self.box("ls")
+        self.assertIn("agentbox-2: half-closed (a close stopped before deleting the server", out)
+        rc, out, calls = self.box("tick")
+        self.assertIn("agentbox-2 is half-closed", out)
+        self.assertIn("Run: box close agentbox-2", out)
+        rc, out, calls = self.box("close", "agentbox-2")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Using the snapshot this close already made (950)", out)
+        self.assertNotIn("create-image", calls)
+        self.assertNotIn("agentbox-2", [x["name"] for x in self.read_state()["servers"]])
+
+    def test_the_tick_finishes_a_stopped_close_when_closing_is_automatic(self):
+        self.half_close()
+        rc, out, calls = self.box("tick", BOX_AUTO_CLOSE_HOURS="12")
+        self.assertIn("agentbox-2 is half-closed (a close stopped before deleting it): finishing the close", out)
+        self.assertNotIn("agentbox-2", [x["name"] for x in self.read_state()["servers"]])
+
+    def test_open_takes_a_half_closed_box_as_it_is(self):
+        self.half_close()
+        rc, out, calls = self.box("open", "agentbox-2")
+        self.assertIn("agentbox-2 is half-closed", out)
+        self.assertIn("hcloud server remove-label agentbox-2 closing", calls)
+        self.assertIn("hcloud server poweron agentbox-2", calls)
+
     def test_ls_doesnt_connect_to_an_off_box_in_single_box_mode(self):
         self.set_server("agentbox-2", "off")
         rc, out, calls = self.box("ls", BOX_MAX_BOXES="1", BOX_NAME="agentbox-2")
@@ -1813,15 +1969,15 @@ exit 0
         self.assertNotEqual(rc, 0, out)
         self.assertIn("agents working outside its tabs", out)
         self.assertIn("claude in /home/dev/work/web (working, started by t3", out)
-        self.assertNotIn("closing=1", calls)
+        self.assertNotIn("closing=", calls)
 
     def test_close_refuses_when_the_box_cant_be_asked_about_its_agents(self):
         rc, out, calls = self.box("close", "agentbox-2", FAKE_AGENTS_FAIL="1")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("Couldn't check agentbox-2 for agents working outside its tabs", out)
-        self.assertNotIn("closing=1", calls)
+        self.assertNotIn("closing=", calls)
         rc, out, calls = self.box("close", "agentbox-2", "--force", FAKE_AGENTS_FAIL="1")
-        self.assertIn("closing=1", calls)
+        self.assertIn("closing=", calls)
 
     def test_what_the_box_reports_reaches_the_terminal_without_control_characters(self):
         row = json.dumps({"pid": 7, "agent": "claude", "folder": "/home/dev/work/web\x1b[2J",
@@ -1835,13 +1991,13 @@ exit 0
         for extra, env in ((("--force",), {"FAKE_AGENTS": self.WORKING}), ((), {"FAKE_AGENTS": self.IDLE})):
             rc, out, calls = self.box("close", "agentbox-2", *extra, **env)
             self.assertNotIn("agents working outside its tabs", out)
-            self.assertIn("closing=1", calls)   # down.sh started
+            self.assertIn("closing=", calls)   # down.sh started
 
     def test_tick_keeps_a_box_whose_agent_is_in_a_long_tool_call(self):
         # an old conversation but a busy process tree: box --agents reports it working
         rc, out, calls = self.box("tick", BOX_AUTO_CLOSE_HOURS="1", FAKE_IDLE_S="7200", FAKE_AGENTS=self.WORKING)
         self.assertIn("wasn't closed", out)
-        self.assertNotIn("closing=1", calls)
+        self.assertNotIn("closing=", calls)
 
     def test_t3_pair_needs_the_setting_a_running_box_and_a_terminal(self):
         rc, out, calls = self.box("t3", "pair", "agentbox-2")

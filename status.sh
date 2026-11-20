@@ -28,7 +28,7 @@ EOF
   if [ "$state" != up ]; then
     hint=$(box_state_hint "$state" "$NAME")
     echo "  ${hint:-not running}"
-  elif bssh -o BatchMode=yes -o ConnectTimeout=5 true 2>/dev/null; then
+  elif box_answers; then
     # One connection: the sessions, the disk, and (box --peers, on a box that has it) the name
     # each Claude session answers to for messages and whether other machines reach it.
     out=$(bssh 'echo "Sessions: $(tmux list-sessions -F "#{session_name}" 2>/dev/null | paste -sd" " - || true)"

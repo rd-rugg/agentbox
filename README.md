@@ -36,7 +36,8 @@ back with every agent session where you left it, one terminal tab each.
 
 - **`box close`** saves which sessions are running, snapshots the server and deletes it.
   Hetzner bills a server for every hour it exists, even switched off, so deleting it is
-  what stops the cost.
+  what stops the cost. A close that is cut short (the laptop shuts down mid-snapshot)
+  shows as `half-closed` in `box ls`, and the next `box close` finishes it.
 - **`box open`** creates a server from the snapshot, using the cheapest type in stock
   within your budget. The sessions start again, each resuming its conversation, and a
   tab opens for each.
